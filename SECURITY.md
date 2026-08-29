@@ -17,6 +17,11 @@ An authorized visitor can submit malformed media and consume the bounded quota,
 bandwidth, CPU, memory, and inode allowance. Extension and signature validation
 reduce accidental or obvious misuse; they are not malware analysis. Do not
 automatically expose, execute, unpack, preview, or import received files.
+Server-side deduplication occurs only after a complete upload, so repeated
+identical files can still consume ingress bandwidth and CPU. Immutable
+per-invitation attempt and ingress budgets bound that cumulative work.
+Duplicate receipts are invitation-scoped, temporary, and capped to prevent
+database growth from becoming an unbounded resource vector.
 
 The VPS necessarily handles encrypted public connections and can inject bytes
 toward the upload endpoint if compromised. The NAS-side invitation checks,

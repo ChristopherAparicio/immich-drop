@@ -256,6 +256,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.patch("/drop/api/uploads/{upload_id}")
     async def patch_upload(request: Request, upload_id: str):
         require_mutation(request); upload = upload_for_session(request, upload_id)
+        raw_length=request.headers.get("content-length"); charged_bytes=0
+        try:
+            parsed_for_charge=int(raw_length) if raw_length is not None else 0
+            if parsed_for_charge>0: charged_bytes=min(parsed_for_charge,get_settings(request).chunk_bytes)
+        except ValueError:
+            pass
+        get_store(request).reserve_ingress(upload,charged_bytes)
         if request.headers.get("content-type", "").split(";",1)[0].strip().lower() != "application/offset+octet-stream":
             return _error(415,"unsupported_media_type")
         if request.headers.get("transfer-encoding"): return _error(400,"ambiguous_body_framing")
@@ -266,6 +273,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try: declared_chunk = int(content_length)
         except ValueError: return _error(400,"invalid_length")
         if not 0 < declared_chunk <= get_settings(request).chunk_bytes: return _error(413,"chunk_too_large")
+        if upload["status"] in {"complete","duplicate"}:
+            return _error(409,"offset_conflict",headers={"Upload-Offset":str(upload["offset"]),
+                "Upload-Length":str(upload["declared_size"]),"Upload-State":_public_state(upload["status"])})
         try: patch_limiter.acquire_nowait()
         except WouldBlock: return _error(429,"server_busy",headers={"Retry-After":"2"})
         try:

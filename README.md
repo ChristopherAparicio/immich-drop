@@ -30,11 +30,15 @@ The public service:
 - has no Immich credential, Docker socket, public administration route, file
   listing, preview, or download route;
 - requires an opaque invitation, password, and finite expiry;
-- reserves byte and file quotas transactionally before accepting data;
+- reserves byte and file quotas transactionally before accepting data and
+  applies immutable cumulative attempt/ingress budgets to each invitation;
 - accepts only explicitly configured photo/video profiles and verifies both
   filename extension and file signature;
 - writes fixed-size resumable chunks to server-generated `.part` files and
   atomically renames a validated completed file;
+- deduplicates completed content only within the same invitation using a
+  server-computed SHA-256, while retaining a bounded temporary receipt so a
+  lost final response can still be resumed safely;
 - bounds both concurrent chunk readers and each chunk's absolute read time;
 - encrypts resumable browser metadata with a session-scoped key instead of
   leaving invitation tokens or visitor filenames in clear browser storage;
@@ -98,6 +102,16 @@ state/
 Original names are bounded metadata only. Disk paths use server-generated UUIDs
 and the validated extension. Archives, SVG, PDF, executable content, and unknown
 formats are refused and are never unpacked.
+
+Deduplication saves staging space and invitation quota, not upload bandwidth:
+the service can identify identical content only after receiving and validating
+the complete file. It never compares or links content across invitations and
+never accepts a client-provided whole-file hash as proof of a duplicate.
+`UPLOAD_WORK_MULTIPLIER` defaults to `3` and bounds cumulative upload-creation
+attempts (including policy or quota rejections), chunk requests, and declared
+chunk bytes from the invitation's file, quota, and fixed chunk limits. The value
+is captured when an invitation is created and is capped at `10`; changing it
+does not weaken existing invitations.
 
 ## Local development
 

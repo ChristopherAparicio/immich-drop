@@ -432,6 +432,7 @@
       message: resume ? 'Ready to resume' : 'Waiting',
       controller: null,
       retryCount: 0,
+      duplicate: false,
     };
   }
 
@@ -498,7 +499,9 @@
 
   function statusText(item) {
     if (item.state === 'uploading') return `${item.message} · ${formatBytes(item.offset)} of ${formatBytes(item.size)}`;
-    if (item.state === 'done') return 'Uploaded successfully';
+    if (item.state === 'done') return item.duplicate
+      ? 'Already received — no additional copy was stored'
+      : 'Uploaded successfully';
     if (item.state === 'cancelled') return 'Cancelled';
     return item.message;
   }
@@ -515,12 +518,14 @@
   function renderSummary() {
     const uploading = items.filter((item) => item.state === 'uploading').length;
     const waiting = items.filter((item) => item.state === 'queued').length;
-    const done = items.filter((item) => item.state === 'done').length;
+    const duplicates = items.filter((item) => item.state === 'done' && item.duplicate).length;
+    const done = items.filter((item) => item.state === 'done' && !item.duplicate).length;
     const errors = items.filter((item) => item.state === 'error').length;
     const parts = [];
     if (uploading) parts.push(`${uploading} uploading`);
     if (waiting) parts.push(`${waiting} waiting`);
     if (done) parts.push(`${done} complete`);
+    if (duplicates) parts.push(`${duplicates} already received`);
     if (errors) parts.push(`${errors} ${errors === 1 ? 'needs' : 'need'} attention`);
     elements.queueSummary.textContent = parts.join(' · ') || 'No active uploads.';
   }
@@ -562,7 +567,7 @@
       if (item.state === 'cancelled') return;
       item.offset = item.size;
       item.state = 'done';
-      item.message = 'Uploaded successfully';
+      item.message = item.duplicate ? 'Already received' : 'Uploaded successfully';
       removeSavedResume(item);
       updateItem(item);
     } catch (error) {
@@ -614,8 +619,13 @@
     if (length !== item.size) throw new Error('The saved upload no longer matches this file.');
     item.offset = validOffset(headerInteger(response, 'Upload-Offset'), item.size);
     const state = response.headers.get('Upload-State');
-    if (state === 'complete') item.offset = item.size;
-    else if (state !== 'receiving') throw new Error('This upload can no longer be resumed.');
+    if (state === 'complete' || state === 'duplicate') {
+      if (item.offset !== item.size) throw new Error('The server returned an invalid terminal upload offset.');
+    }
+    if (state === 'duplicate') {
+      item.duplicate = true;
+    }
+    else if (state !== 'receiving' && state !== 'complete') throw new Error('This upload can no longer be resumed.');
     persistResumes();
   }
 
@@ -646,11 +656,18 @@
       item.controller = null;
 
       if (response.status === 409) {
+        const conflictState = response.headers.get('Upload-State');
         const rawExpected = response.headers.get('Upload-Offset');
         if (rawExpected && /^\d+$/.test(rawExpected)) {
           item.offset = validOffset(Number(rawExpected), item.size);
         } else {
           await headUpload(item);
+        }
+        if (conflictState === 'complete' || conflictState === 'duplicate') {
+          if (item.offset !== item.size) throw new Error('The server returned an invalid terminal upload offset.');
+        }
+        if (conflictState === 'duplicate') {
+          item.duplicate = true;
         }
         persistResumes();
         updateItem(item);
@@ -659,6 +676,16 @@
       if (!response.ok) throw new HttpError(response, await responseBody(response));
       const acknowledged = validOffset(headerInteger(response, 'Upload-Offset'), item.size);
       if (acknowledged !== start + chunk.size) throw new Error('The server did not acknowledge this chunk exactly.');
+      const uploadState = response.headers.get('Upload-State');
+      if (uploadState === 'duplicate') {
+        if (acknowledged !== item.size) throw new Error('The server returned an invalid duplicate offset.');
+        item.duplicate = true;
+      }
+      else if (acknowledged === item.size && uploadState !== 'complete') {
+        throw new Error('The server returned an invalid completed upload state.');
+      } else if (acknowledged < item.size && uploadState !== 'receiving') {
+        throw new Error('The server returned an invalid upload state.');
+      }
       item.offset = acknowledged;
       item.retryCount = 0;
       persistResumes();
