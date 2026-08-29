@@ -1,0 +1,31 @@
+services:
+  immich-drop:
+    build:
+      context: .
+    image: immich-drop:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SESSION_SECRET_FILE: /run/secrets/session_secret
+    secrets:
+      - session_secret
+    volumes:
+      - ./.local/incoming:/incoming
+      - ./.local/state:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+
+secrets:
+  session_secret:
+    file: ./.local/session-secret

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f8f5">
+  <title>Private photo drop</title>
+  <link rel="icon" type="image/png" href="/drop/assets/favicon.png">
+  <link rel="stylesheet" href="/drop/assets/drop.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to upload</a>
+
+  <main id="main" class="shell">
+    <header class="hero">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" focusable="false">
+          <path d="M16 3v17m0-17-6 6m6-6 6 6M6 18v7a4 4 0 0 0 4 4h12a4 4 0 0 0 4-4v-7" />
+        </svg>
+      </div>
+      <div>
+        <p class="eyebrow">Private upload</p>
+        <h1 id="inviteTitle">Share your moments</h1>
+        <p class="intro">Files go directly to a private, self-hosted drop. No account is required.</p>
+      </div>
+    </header>
+
+    <section id="loadingPanel" class="card centered" aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span>
+      <p>Checking this invitation…</p>
+    </section>
+
+    <section id="closedPanel" class="card centered" hidden>
+      <div class="state-icon" aria-hidden="true">×</div>
+      <h2 id="closedTitle">This invitation is unavailable</h2>
+      <p id="closedMessage" class="muted">Ask the sender for a new upload link.</p>
+    </section>
+
+    <section id="unlockPanel" class="card" hidden aria-labelledby="unlockTitle">
+      <div class="section-heading">
+        <div class="lock" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false"><path d="M7 10V7a5 5 0 0 1 10 0v3m-11 0h12a2 2 0 0 1 2 2v8H4v-8a2 2 0 0 1 2-2Z" /></svg>
+        </div>
+        <div>
+          <h2 id="unlockTitle">Enter the invitation password</h2>
+          <p class="muted">The password is checked securely and is never stored by this page.</p>
+        </div>
+      </div>
+      <form id="unlockForm" novalidate>
+        <label for="password">Password</label>
+        <div class="password-row">
+          <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256" spellcheck="false">
+          <button id="unlockButton" class="button primary" type="submit">Unlock</button>
+        </div>
+        <p id="unlockError" class="field-error" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <div id="uploader" hidden>
+      <section class="card policy-card" aria-labelledby="policyTitle">
+        <div class="policy-topline">
+          <div>
+            <p class="eyebrow">Invitation details</p>
+            <h2 id="policyTitle">What you can send</h2>
+          </div>
+          <span id="profileBadge" class="badge">Photos and videos</span>
+        </div>
+        <dl class="policy-grid">
+          <div><dt>Accepted</dt><dd id="policyTypes">—</dd></div>
+          <div><dt>Per file</dt><dd id="policyFileSize">—</dd></div>
+          <div><dt>File limit</dt><dd id="policyFileCount">—</dd></div>
+          <div><dt>Total limit</dt><dd id="policyQuota">—</dd></div>
+          <div class="wide"><dt>Invitation expires</dt><dd id="policyExpiry">—</dd></div>
+        </dl>
+      </section>
+
+      <section id="resumeNotice" class="notice" hidden aria-live="polite">
+        <div>
+          <strong>Uploads can be resumed</strong>
+          <p id="resumeText">Select the same files again to continue from the last confirmed byte.</p>
+        </div>
+        <button id="resumePickButton" class="button secondary compact" type="button">Reselect files</button>
+      </section>
+
+      <section class="card picker-card" aria-labelledby="pickerTitle">
+        <div id="dropZone" class="drop-zone">
+          <svg class="upload-icon" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+            <path d="M16 4v17m0-17-6 6m6-6 6 6M5 20v5a3 3 0 0 0 3 3h16a3 3 0 0 0 3-3v-5" />
+          </svg>
+          <h2 id="pickerTitle">Choose files to share</h2>
+          <p id="pickerHint" class="muted">Choose multiple files from Photos or Files. You can return and add more later.</p>
+          <label class="button primary pick-button" for="fileInput">Choose files</label>
+          <input id="fileInput" class="visually-hidden" type="file" multiple>
+          <p class="desktop-hint">You can also drop files anywhere in this box.</p>
+        </div>
+        <p class="privacy-note">
+          Only files you choose are sent. The server verifies every completed file. This page does not display or download previously uploaded media.
+        </p>
+      </section>
+
+      <section id="queueSection" class="queue-section" hidden aria-labelledby="queueTitle">
+        <div class="queue-heading">
+          <div>
+            <p class="eyebrow">This device</p>
+            <h2 id="queueTitle">Uploads</h2>
+          </div>
+          <button id="clearFinishedButton" class="text-button" type="button">Clear finished</button>
+        </div>
+        <div id="queueSummary" class="summary" role="status" aria-live="polite">No files selected.</div>
+        <ul id="uploadList" class="upload-list"></ul>
+      </section>
+    </div>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <footer>
+      <p>Private by design · Self-hosted · No tracking</p>
+    </footer>
+  </main>
+
+  <script src="/drop/assets/app.js" defer></script>
+</body>
+</html>

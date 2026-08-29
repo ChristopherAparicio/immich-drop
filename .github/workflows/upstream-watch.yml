@@ -1,0 +1,37 @@
+name: Watch upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * 1"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout notices
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Open one review issue when upstream moves
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          baseline=$(sed -n 's/^- upstream commit: `\([0-9a-f]\{40\}\)`$/\1/p' THIRD_PARTY_NOTICES.md)
+          test -n "$baseline"
+          current=$(git ls-remote https://github.com/Nasogaa/immich-drop.git refs/heads/master | cut -f1)
+          test -n "$current"
+          if [ "$current" = "$baseline" ]; then
+            exit 0
+          fi
+          title="Review new upstream Immich Drop changes"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq 'length')
+          if [ "$existing" -eq 0 ]; then
+            gh issue create \
+              --title "$title" \
+              --body "The monitored upstream moved from \`$baseline\` to \`$current\`. Review the source diff manually; never merge or publish upstream history automatically.\n\nCompare: https://github.com/Nasogaa/immich-drop/compare/$baseline...$current"
+          fi
