@@ -22,7 +22,7 @@ docker volume create "$incoming_volume" >/dev/null
 docker volume create "$state_volume" >/dev/null
 docker run --rm --user 0 \
     -v "$incoming_volume:/incoming" -v "$state_volume:/data" \
-    "$image" sh -c 'chown 65532:65532 /incoming /data'
+    "$image" sh -c 'chown 65532:65532 /incoming /data && chmod 0700 /incoming /data'
 
 set -- \
     -e INCOMING_ROOT=/incoming \

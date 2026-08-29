@@ -103,8 +103,8 @@ incoming directories for tests.
 
 ```bash
 cp .env.example .env
-mkdir -p .local/incoming .local/state
 umask 077
+mkdir -p .local/incoming .local/state
 openssl rand -base64 48 > .local/session-secret
 docker compose -f compose.example.yml run --rm --build immich-drop \
   python -m app.cli init --yes

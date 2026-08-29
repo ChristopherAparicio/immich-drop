@@ -15,6 +15,7 @@ from pathlib import Path
 
 from anyio import CapacityLimiter, WouldBlock
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.sessions import SessionMiddleware
@@ -124,6 +125,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.exception_handler(StorageError)
     async def storage_error(_request: Request, exc: StorageError):
         return _error(exc.status, exc.code, str(exc))
+
+    @application.exception_handler(RequestValidationError)
+    async def invalid_body(_request: Request, _exc: RequestValidationError):
+        # FastAPI's default validation payload repeats rejected input. That can
+        # include a password or visitor filename, so expose only a stable code.
+        return _error(422, "invalid_request")
 
     @application.exception_handler(Exception)
     async def unexpected_error(_request: Request, _exc: Exception):

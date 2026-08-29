@@ -17,7 +17,7 @@ import app.storage as storage_module
 from fastapi.testclient import TestClient
 
 from app.app import CSRF_COOKIE, create_app
-from app.config import MARKER_NAME, MARKER_VALUE, Settings
+from app.config import MARKER_NAME, MARKER_VALUE, Settings, load_settings
 from app.storage import InsufficientStorage, InviteSpec, QuotaExceeded, StorageError, Store
 from dropctl import main as cli_main, parser, read_password
 
@@ -25,8 +25,9 @@ ORIGIN = "https://drop.test"
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    incoming = tmp_path / "incoming"; incoming.mkdir(); (incoming / MARKER_NAME).write_text(MARKER_VALUE)
-    data = tmp_path / "data"; data.mkdir()
+    incoming = tmp_path / "incoming"; incoming.mkdir(mode=0o700)
+    marker=incoming / MARKER_NAME; marker.write_text(MARKER_VALUE); marker.chmod(0o600)
+    data = tmp_path / "data"; data.mkdir(mode=0o700)
     return Settings(incoming,data/"state.db",ORIGIN,"s"*48,global_budget_bytes=10_000_000,
                     disk_reserve_bytes=1,default_max_file_bytes=2_000_000,
                     default_max_files=10,default_quota_bytes=5_000_000,
@@ -69,12 +70,13 @@ def patch(client: TestClient, url: str, offset: int, data: bytes, checksum=True)
     return client.patch(url,content=data,headers=headers)
 
 def test_marker_and_secret_are_fail_closed(tmp_path: Path):
-    incoming=tmp_path/"incoming"; incoming.mkdir(); data=tmp_path/"data"; data.mkdir()
+    incoming=tmp_path/"incoming"; incoming.mkdir(mode=0o700)
+    data=tmp_path/"data"; data.mkdir(mode=0o700)
     cfg=Settings(incoming,data/"state.db",ORIGIN,"short",disk_reserve_bytes=1)
     with pytest.raises(RuntimeError): cfg.validate()
     cfg=Settings(incoming,data/"state.db",ORIGIN,"x"*40,disk_reserve_bytes=1)
     with pytest.raises(RuntimeError,match="marker"): cfg.validate()
-    (incoming/MARKER_NAME).write_text(MARKER_VALUE)
+    marker=incoming/MARKER_NAME; marker.write_text(MARKER_VALUE); marker.chmod(0o600)
     cfg.validate()
 
 def test_password_csrf_origin_and_policy(client: TestClient, invitation):
@@ -295,6 +297,23 @@ def test_tokens_and_passwords_are_not_logged(client: TestClient, invitation, cap
     text="\n".join(record.getMessage() for record in caplog.records if record.name=="immich_drop")
     assert "status=401" in text
     assert token not in text and "wrong-secret-password" not in text
+
+def test_validation_errors_never_echo_password_or_filename(client: TestClient, invitation):
+    _,token,_=invitation
+    client.get(f"/drop/i/{token}")
+    secret="private-password-" + "x"*250
+    response=client.post(f"/drop/api/invites/{token}/unlock",json={"password":secret},
+        headers={"Origin":ORIGIN,"X-Drop-CSRF":csrf(client)})
+    assert response.status_code==422 and response.json()["error"]=="invalid_request"
+    assert secret not in response.text
+
+def test_secret_file_and_state_permissions_fail_closed(settings: Settings,monkeypatch,tmp_path: Path):
+    secret=tmp_path/"session-secret"; secret.write_text("s"*48); secret.chmod(0o644)
+    monkeypatch.setenv("SESSION_SECRET_FILE",str(secret))
+    with pytest.raises(RuntimeError,match="private regular file"): load_settings()
+    insecure=tmp_path/"insecure-state"; insecure.mkdir(mode=0o755)
+    candidate=Settings(**{**settings.__dict__,"state_db":insecure/"state.db"})
+    with pytest.raises(RuntimeError,match="STATE_DB parent"): candidate.validate()
 
 def test_unexpected_errors_do_not_log_internal_paths(settings: Settings, caplog, monkeypatch):
     token="unexpected-error-token-1234"; store=Store(settings); store.initialize()

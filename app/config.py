@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -9,6 +10,36 @@ from urllib.parse import urlparse
 MARKER_NAME = ".immich-drop-root"
 MARKER_VALUE = "immich-drop-incoming-v1\n"
 MAX_PASSWORD_BYTES = 256
+
+def _private_directory(path: Path, name: str) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{name} must already exist") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise RuntimeError(f"{name} must be a private directory owned by the service user")
+
+def _read_private_file(path: Path, name: str, maximum: int) -> str:
+    if not path.is_absolute():
+        raise RuntimeError(f"{name} must be an absolute path")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise RuntimeError(f"{name} cannot be opened safely") from exc
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077):
+            raise RuntimeError(f"{name} must be a private regular file owned by the service user")
+        raw = os.read(fd, maximum + 1)
+        if len(raw) > maximum:
+            raise RuntimeError(f"{name} is too large")
+    finally:
+        os.close(fd)
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{name} must be UTF-8") from exc
 
 def _positive_int(name: str, default: int) -> int:
     try:
@@ -55,15 +86,16 @@ class Settings:
         if self.chunk_bytes != 8 * 1024**2:
             raise RuntimeError("UPLOAD_CHUNK_BYTES must be exactly 8388608")
         root = self.incoming_root
-        if not root.is_absolute() or root.is_symlink() or not root.is_dir():
-            raise RuntimeError("INCOMING_ROOT must be an existing absolute non-symlink directory")
+        if not root.is_absolute():
+            raise RuntimeError("INCOMING_ROOT must be absolute")
+        _private_directory(root, "INCOMING_ROOT")
         if require_marker:
             marker = root / MARKER_NAME
-            try:
-                if marker.is_symlink() or marker.read_text(encoding="utf-8") != MARKER_VALUE:
-                    raise RuntimeError("INCOMING_ROOT marker is invalid")
-            except OSError as exc:
-                raise RuntimeError("INCOMING_ROOT marker is missing or unreadable") from exc
+            if _read_private_file(marker, "INCOMING_ROOT marker", 128) != MARKER_VALUE.strip():
+                raise RuntimeError("INCOMING_ROOT marker is invalid")
+        if not self.state_db.is_absolute():
+            raise RuntimeError("STATE_DB must be absolute")
+        _private_directory(self.state_db.parent, "STATE_DB parent")
         try:
             resolved_root = root.resolve(strict=True)
             resolved_db_parent = self.state_db.parent.resolve(strict=True)
@@ -85,14 +117,7 @@ def load_settings() -> Settings:
     secret_file = os.getenv("SESSION_SECRET_FILE", "").strip()
     if secret_file:
         path = Path(secret_file)
-        try:
-            if not path.is_absolute() or path.is_symlink() or not path.is_file():
-                raise RuntimeError("SESSION_SECRET_FILE must be an absolute regular non-symlink file")
-            if path.stat().st_mode & 0o077:
-                raise RuntimeError("SESSION_SECRET_FILE permissions must be 0600 or stricter")
-            secret = path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise RuntimeError("SESSION_SECRET_FILE is unreadable") from exc
+        secret = _read_private_file(path, "SESSION_SECRET_FILE", 4096)
     else:
         secret = os.getenv("SESSION_SECRET", "")
     return Settings(
