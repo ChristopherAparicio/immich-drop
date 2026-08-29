@@ -53,6 +53,8 @@ administration, filesystem, debug, or download route.
 - Expired or closed invitation: new work is denied and partial work is swept.
 - Wrong offset, oversized chunk, quota race, or type mismatch: request is
   rejected without exposing a filesystem path.
+- A slow client exceeds the absolute per-chunk deadline and releases its
+  bounded application concurrency slot.
 - VPS-to-NAS tunnel or NAS filter unavailable: public upload routes fail
   closed.
 

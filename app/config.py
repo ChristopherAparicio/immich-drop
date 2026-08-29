@@ -67,6 +67,8 @@ class Settings:
     max_client_concurrency: int = 2
     max_active_uploads: int = 3
     max_active_unlocks: int = 2
+    chunk_read_timeout_seconds: int = 180
+    sweep_interval_seconds: int = 300
     max_invite_ttl_seconds: int = 7 * 24 * 3600
     log_level: str = "INFO"
     cookie_secure: bool = True
@@ -105,7 +107,8 @@ class Settings:
             raise RuntimeError("STATE_DB must be outside INCOMING_ROOT")
         values = (self.global_budget_bytes, self.disk_reserve_bytes, self.default_max_file_bytes,
                   self.default_max_files, self.default_quota_bytes, self.incomplete_ttl_seconds,
-                  self.max_client_concurrency,self.max_active_uploads,self.max_active_unlocks,self.max_invite_ttl_seconds)
+                  self.max_client_concurrency,self.max_active_uploads,self.max_active_unlocks,
+                  self.chunk_read_timeout_seconds,self.sweep_interval_seconds,self.max_invite_ttl_seconds)
         if any(value <= 0 for value in values):
             raise RuntimeError("All resource limits must be greater than zero")
         if self.default_max_file_bytes > self.default_quota_bytes:
@@ -136,6 +139,8 @@ def load_settings() -> Settings:
         max_client_concurrency=_positive_int("MAX_CLIENT_CONCURRENCY", 2),
         max_active_uploads=_positive_int("MAX_ACTIVE_UPLOADS", 3),
         max_active_unlocks=_positive_int("MAX_ACTIVE_UNLOCKS", 2),
+        chunk_read_timeout_seconds=_positive_int("UPLOAD_CHUNK_TIMEOUT_SECONDS", 180),
+        sweep_interval_seconds=_positive_int("SWEEP_INTERVAL_SECONDS", 300),
         max_invite_ttl_seconds=_positive_int("MAX_INVITE_TTL_SECONDS", 7 * 24 * 3600),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         cookie_secure=os.getenv("COOKIE_SECURE", "true").lower() not in {"0", "false", "no"},

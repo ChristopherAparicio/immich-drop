@@ -35,6 +35,9 @@ The public service:
   filename extension and file signature;
 - writes fixed-size resumable chunks to server-generated `.part` files and
   atomically renames a validated completed file;
+- bounds both concurrent chunk readers and each chunk's absolute read time;
+- encrypts resumable browser metadata with a session-scoped key instead of
+  leaving invitation tokens or visitor filenames in clear browser storage;
 - refuses to start when its marker-backed staging mount is absent;
 - keeps public HTML, CSS, and JavaScript local: no CDN, analytics, fonts, or
   telemetry service.
@@ -79,7 +82,8 @@ CLI or database endpoint.
 
 The configured incoming root must be a dedicated NAS mount with a filesystem
 or dataset quota. The application also enforces a global byte budget and a
-fixed free-space reserve.
+fixed free-space reserve, including bytes reserved but not yet written. A
+single embedded maintenance loop releases abandoned partial reservations.
 
 ```text
 incoming/

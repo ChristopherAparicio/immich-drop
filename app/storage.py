@@ -222,11 +222,15 @@ class Store:
             self.ensure_open(current)
             stats = conn.execute("SELECT COUNT(*) n,COALESCE(SUM(reserved_bytes),0) b FROM uploads WHERE invite_id=? AND status IN ('uploading','complete')", (invite["id"],)).fetchone()
             total = conn.execute("SELECT COALESCE(SUM(reserved_bytes),0) b FROM uploads WHERE status IN ('uploading','complete')").fetchone()["b"]
+            pending = conn.execute("SELECT COALESCE(SUM(declared_size-offset),0) b FROM uploads WHERE status='uploading'").fetchone()["b"]
             if stats["n"] + 1 > current["max_files"] or stats["b"] + size > current["quota_bytes"]:
                 raise QuotaExceeded("Invitation quota reached")
             if total + size > self.settings.global_budget_bytes:
                 raise QuotaExceeded("Global staging budget reached")
-            if shutil.disk_usage(self.settings.incoming_root).free - size < self.settings.disk_reserve_bytes:
+            # `free` already accounts for bytes written so far. Subtract every
+            # still-reserved byte as well, otherwise several empty `.part`
+            # files can collectively promise more than the disk reserve.
+            if shutil.disk_usage(self.settings.incoming_root).free - pending - size < self.settings.disk_reserve_bytes:
                 raise QuotaExceeded("Disk reserve would be breached")
             conn.execute("""INSERT INTO uploads
                 (id,invite_id,original_name,extension,category,declared_size,offset,status,reserved_bytes,created_at,updated_at)

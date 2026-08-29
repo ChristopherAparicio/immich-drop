@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from anyio import CapacityLimiter, WouldBlock
+from anyio import CapacityLimiter, WouldBlock, create_task_group, fail_after, sleep, to_thread
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -62,7 +62,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logging.basicConfig(level=current.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         store = Store(current); store.initialize(); store.reconcile(); store.sweep()
         application.state.settings = current; application.state.store = store
-        yield
+        async def maintenance() -> None:
+            while True:
+                await sleep(current.sweep_interval_seconds)
+                try:
+                    removed = await to_thread.run_sync(store.sweep)
+                    if removed: logger.info("maintenance action=sweep removed=%s",removed)
+                except Exception:
+                    logger.error("maintenance action=sweep status=failed")
+        async with create_task_group() as tasks:
+            tasks.start_soon(maintenance)
+            yield
+            tasks.cancel_scope.cancel()
 
     application = FastAPI(title="Immich Drop Staging", docs_url=None, redoc_url=None,
                           openapi_url=None, lifespan=lifespan)
@@ -259,9 +270,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except WouldBlock: return _error(429,"server_busy",headers={"Retry-After":"2"})
         try:
             data = bytearray()
-            async for block in request.stream():
-                data.extend(block)
-                if len(data) > get_settings(request).chunk_bytes: return _error(413,"chunk_too_large")
+            try:
+                with fail_after(get_settings(request).chunk_read_timeout_seconds):
+                    async for block in request.stream():
+                        data.extend(block)
+                        if len(data) > get_settings(request).chunk_bytes: return _error(413,"chunk_too_large")
+            except TimeoutError:
+                return _error(408,"chunk_timeout")
             if len(data) != declared_chunk: return _error(400,"length_mismatch")
             checksum = None
             raw_checksum = request.headers.get("upload-checksum")

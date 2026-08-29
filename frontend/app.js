@@ -48,6 +48,8 @@
   let activeCount = 0;
   let scheduling = false;
   let toastTimer = null;
+  let resumeStorage = null;
+  let persistRevision = 0;
   const items = [];
   let savedResumes = [];
 
@@ -105,8 +107,66 @@
     return `/drop/api/invites/${encodeURIComponent(token)}/uploads`;
   }
 
-  function resumeStorageKey() {
-    return `sovereign-drop:resume:${token}`;
+  async function resumeStorageContext() {
+    if (resumeStorage) return resumeStorage;
+    const csrf = csrfToken();
+    if (!token || !csrf || !window.crypto || !window.crypto.subtle) {
+      throw new Error('Private resume storage is unavailable.');
+    }
+    const encoder = new TextEncoder();
+    const tokenDigest = new Uint8Array(await window.crypto.subtle.digest('SHA-256', encoder.encode(token)));
+    const keyDigest = await window.crypto.subtle.digest(
+      'SHA-256', encoder.encode(`immich-drop-resume-v1\u0000${token}\u0000${csrf}`),
+    );
+    const key = await window.crypto.subtle.importKey('raw', keyDigest, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    try {
+      // v0.1.0 briefly used the raw token and plaintext metadata. Never migrate
+      // that record: discard it as soon as this invitation is opened again.
+      localStorage.removeItem(`sovereign-drop:resume:${token}`);
+    } catch { /* Private browsing may disable local storage entirely. */ }
+    resumeStorage = {
+      name: `sovereign-drop:resume:v1:${base64Url(tokenDigest)}`,
+      key,
+    };
+    return resumeStorage;
+  }
+
+  function base64Url(bytes) {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return window.btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+  }
+
+  function base64Bytes(bytes) {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return window.btoa(binary);
+  }
+
+  function decodeBase64(value) {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new Error('Invalid private resume record.');
+    const binary = window.atob(value);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+
+  async function encryptResumeRecords(records) {
+    const context = await resumeStorageContext();
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const plaintext = new TextEncoder().encode(JSON.stringify(records));
+    const ciphertext = new Uint8Array(await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, context.key, plaintext));
+    return { context, value: JSON.stringify({ v: 1, iv: base64Bytes(iv), data: base64Bytes(ciphertext) }) };
+  }
+
+  async function decryptResumeRecords(value) {
+    const context = await resumeStorageContext();
+    const envelope = JSON.parse(value);
+    if (!envelope || envelope.v !== 1) throw new Error('Unsupported private resume record.');
+    const iv = decodeBase64(envelope.iv);
+    if (iv.length !== 12) throw new Error('Invalid private resume record.');
+    const plaintext = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv }, context.key, decodeBase64(envelope.data),
+    );
+    return { context, records: JSON.parse(new TextDecoder().decode(plaintext)) };
   }
 
   function showOnly(panel) {
@@ -213,7 +273,7 @@
       if (!response.ok) throw new HttpError(response, body);
       policy = validatePolicy(body);
       renderPolicy();
-      restoreResumeRecords();
+      await restoreResumeRecords();
       showOnly(elements.uploader);
     } catch (error) {
       if (error instanceof HttpError) {
@@ -675,6 +735,7 @@
     if (error.status === 401 || error.status === 403) return 'This invitation is no longer authorized.';
     if (error.status === 404 || error.status === 410) return 'This invitation or upload has ended.';
     if (error.status === 413) return 'The file or invitation limit was exceeded.';
+    if (error.status === 408) return 'This chunk took too long. Select Retry on a better connection.';
     if (error.status === 415) return 'The file contents do not match an accepted media type.';
     if (error.status === 422) return 'The server rejected this file type or name.';
     if (error.status === 429) return 'The service is busy. Select Retry in a moment.';
@@ -732,19 +793,36 @@
       }));
     const untouched = savedResumes.filter((record) => !items.some((item) => fileKey(item) === fileKey(record)));
     savedResumes = [...active, ...untouched].slice(0, policy ? policy.maxFiles : 100);
-    try {
-      if (savedResumes.length) localStorage.setItem(resumeStorageKey(), JSON.stringify(savedResumes));
-      else localStorage.removeItem(resumeStorageKey());
-    } catch {
-      // Resuming after reload is optional when private browsing blocks storage.
-    }
+    const revision = ++persistRevision;
+    const snapshot = savedResumes.map((record) => ({ ...record }));
+    void (async () => {
+      try {
+        const context = await resumeStorageContext();
+        if (revision !== persistRevision) return;
+        if (!snapshot.length) {
+          localStorage.removeItem(context.name);
+          return;
+        }
+        const encrypted = await encryptResumeRecords(snapshot);
+        if (revision === persistRevision) localStorage.setItem(encrypted.context.name, encrypted.value);
+      } catch {
+        // Resuming after reload is optional when private browsing blocks storage.
+      }
+    })();
   }
 
-  function restoreResumeRecords() {
+  async function restoreResumeRecords() {
     try {
-      const parsed = JSON.parse(localStorage.getItem(resumeStorageKey()) || '[]');
-      savedResumes = Array.isArray(parsed)
-        ? parsed.filter(validResumeRecord).slice(0, policy.maxFiles)
+      const context = await resumeStorageContext();
+      const value = localStorage.getItem(context.name);
+      if (!value) {
+        savedResumes = [];
+        updateResumeNotice();
+        return;
+      }
+      const decrypted = await decryptResumeRecords(value);
+      savedResumes = Array.isArray(decrypted.records)
+        ? decrypted.records.filter(validResumeRecord).slice(0, policy.maxFiles)
         : [];
     } catch {
       savedResumes = [];
@@ -764,10 +842,7 @@
 
   function removeSavedResume(item) {
     savedResumes = savedResumes.filter((record) => fileKey(record) !== fileKey(item));
-    try {
-      if (savedResumes.length) localStorage.setItem(resumeStorageKey(), JSON.stringify(savedResumes));
-      else localStorage.removeItem(resumeStorageKey());
-    } catch { /* Optional browser persistence. */ }
+    persistResumes();
   }
 
   function updateResumeNotice() {

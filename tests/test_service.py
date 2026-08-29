@@ -167,6 +167,22 @@ def test_atomic_quota_reservation_race(settings: Settings):
     with store.connect() as conn:
         assert conn.execute("SELECT SUM(reserved_bytes) FROM uploads").fetchone()[0]==600
 
+def test_disk_reserve_includes_all_unwritten_reservations(settings: Settings,monkeypatch):
+    limited=Settings(**{**settings.__dict__,"disk_reserve_bytes":500})
+    store=Store(limited); store.initialize(); token="disk-reserve-race"
+    store.create_invite(token,"password",InviteSpec("Disk","Disk","photos",int(time.time())+60,1000,5,3000))
+    monkeypatch.setattr(storage_module.shutil,"disk_usage",lambda _path: type("Usage",(),{"free":1000})())
+    barrier=threading.Barrier(2)
+    def attempt(index):
+        barrier.wait()
+        try: store.reserve_upload(store.find_invite(token),f"disk-{index}.jpg",400); return "ok"
+        except QuotaExceeded: return "quota"
+    with ThreadPoolExecutor(max_workers=2) as pool: results=list(pool.map(attempt,range(2)))
+    assert sorted(results)==["ok","quota"]
+    with store.connect() as conn:
+        pending=conn.execute("SELECT SUM(declared_size-offset) FROM uploads WHERE status='uploading'").fetchone()[0]
+    assert pending==400
+
 def test_expiry_blocks_existing_session(client: TestClient, invitation):
     store,token,invite_id=invitation; assert unlock(client,token).status_code==204
     with store.connect(True) as conn: conn.execute("UPDATE invites SET expires_at=? WHERE id=?",(int(time.time())-1,invite_id))
@@ -354,6 +370,23 @@ def test_global_active_patch_limit_returns_429(settings: Settings):
         assert done.status_code==204
         assert second.status_code==429 and second.headers["retry-after"]=="2"
 
+def test_chunk_read_has_absolute_timeout(settings: Settings):
+    limited=Settings(**{**settings.__dict__,"chunk_read_timeout_seconds":1})
+    store=Store(limited); store.initialize(); token="slow-chunk-token-1234"
+    store.create_invite(token,"password",InviteSpec("Slow","Slow","photos",int(time.time())+60,1000,2,1500))
+    with TestClient(create_app(limited),base_url=ORIGIN) as c:
+        assert unlock(c,token,"password").status_code==204
+        upload=create_upload(c,token,"slow.jpg",b"\xff\xd8\xffslow")
+        def slow_body():
+            yield b"\xff\xd8\xff"
+            time.sleep(1.2)
+            yield b"slow"
+        response=c.patch(upload["uploadUrl"],content=slow_body(),headers={
+            "Origin":ORIGIN,"X-Drop-CSRF":csrf(c),"Content-Type":"application/offset+octet-stream",
+            "Content-Length":"7","Upload-Offset":"0",
+        })
+    assert response.status_code==408 and response.json()["error"]=="chunk_timeout"
+
 def test_global_argon_limiter_returns_429(settings: Settings):
     limited=Settings(**{**settings.__dict__,"max_active_unlocks":1}); store=Store(limited); store.initialize()
     token="argon-limit-token-1234"; store.create_invite(token,"password",InviteSpec("Argon","Argon","photos",int(time.time())+60,1000,2,1500))
@@ -376,6 +409,20 @@ def test_sweep_releases_expired_incomplete_upload(settings: Settings):
     with store.connect(True) as conn: conn.execute("UPDATE invites SET expires_at=? WHERE id=?",(1,invite_id))
     assert store.sweep()==1
     with store.connect() as conn: assert conn.execute("SELECT COUNT(*) FROM uploads WHERE id=?",(upload["id"],)).fetchone()[0]==0
+
+def test_embedded_sweeper_releases_abandoned_upload(settings: Settings):
+    limited=Settings(**{**settings.__dict__,"incomplete_ttl_seconds":1,"sweep_interval_seconds":1})
+    store=Store(limited); store.initialize(); token="periodic-sweep-token"
+    store.create_invite(token,"password",InviteSpec("Sweep","Sweep","photos",int(time.time())+60,1000,2,1500))
+    upload=store.reserve_upload(store.find_invite(token),"x.jpg",100)
+    with TestClient(create_app(limited),base_url=ORIGIN):
+        with store.connect(True) as conn: conn.execute("UPDATE uploads SET updated_at=0 WHERE id=?",(upload["id"],))
+        deadline=time.time()+2.5
+        while time.time()<deadline:
+            with store.connect() as conn:
+                if conn.execute("SELECT COUNT(*) FROM uploads WHERE id=?",(upload["id"],)).fetchone()[0]==0: break
+            time.sleep(0.1)
+        else: pytest.fail("embedded sweeper did not release abandoned reservation")
 
 def test_cli_has_no_password_argument_and_secure_defaults():
     parsed=parser().parse_args(["open","--label","Event","--profile","photos+videos","--ttl","1h"])

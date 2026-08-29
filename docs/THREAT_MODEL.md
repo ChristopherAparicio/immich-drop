@@ -32,6 +32,9 @@ must remain inside that invitation's immutable limits.
 - Completed files cannot be listed, previewed, or downloaded publicly.
 - Sessions are invitation-scoped; state changes require same-origin requests
   and a CSRF token.
+- Browser resume metadata is AES-GCM encrypted with a key derived from the
+  invitation token and path-scoped CSRF cookie; legacy plaintext state is
+  discarded, not migrated.
 - Logs use request identifiers and coarse outcomes, not invitation URLs,
   tokens, passwords, cookies, query strings, filenames, or filesystem paths.
 - The container is non-root, read-only apart from explicit state/staging

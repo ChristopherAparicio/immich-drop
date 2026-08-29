@@ -20,8 +20,9 @@ process arguments or shell history.
 Share the invitation URL and password through separate channels when practical.
 Closing an invitation immediately prevents new sessions and new upload
 requests. A chunk already being written may finish atomically; every waiting or
-subsequent chunk is refused. Run the sweeper regularly from one place only to
-expire invitations and abandoned partials.
+subsequent chunk is refused. The embedded single-process sweeper expires
+abandoned partials at the configured bounded interval. Run the CLI sweeper only
+for an explicit operator check; do not install a second recurring sweep job.
 
 ## Staging and import
 
