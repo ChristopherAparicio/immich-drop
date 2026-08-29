@@ -67,6 +67,7 @@ class Settings:
     max_client_concurrency: int = 2
     max_active_uploads: int = 3
     max_active_unlocks: int = 2
+    upload_work_multiplier: int = 3
     chunk_read_timeout_seconds: int = 180
     sweep_interval_seconds: int = 300
     max_invite_ttl_seconds: int = 7 * 24 * 3600
@@ -108,13 +109,16 @@ class Settings:
         values = (self.global_budget_bytes, self.disk_reserve_bytes, self.default_max_file_bytes,
                   self.default_max_files, self.default_quota_bytes, self.incomplete_ttl_seconds,
                   self.max_client_concurrency,self.max_active_uploads,self.max_active_unlocks,
-                  self.chunk_read_timeout_seconds,self.sweep_interval_seconds,self.max_invite_ttl_seconds)
+                  self.upload_work_multiplier,self.chunk_read_timeout_seconds,
+                  self.sweep_interval_seconds,self.max_invite_ttl_seconds)
         if any(value <= 0 for value in values):
             raise RuntimeError("All resource limits must be greater than zero")
         if self.default_max_file_bytes > self.default_quota_bytes:
             raise RuntimeError("DEFAULT_MAX_FILE_BYTES cannot exceed DEFAULT_QUOTA_BYTES")
         if self.default_quota_bytes > self.global_budget_bytes:
             raise RuntimeError("DEFAULT_QUOTA_BYTES cannot exceed GLOBAL_BUDGET_BYTES")
+        if self.upload_work_multiplier > 10:
+            raise RuntimeError("UPLOAD_WORK_MULTIPLIER cannot exceed 10")
 
 def load_settings() -> Settings:
     secret_file = os.getenv("SESSION_SECRET_FILE", "").strip()
@@ -139,6 +143,7 @@ def load_settings() -> Settings:
         max_client_concurrency=_positive_int("MAX_CLIENT_CONCURRENCY", 2),
         max_active_uploads=_positive_int("MAX_ACTIVE_UPLOADS", 3),
         max_active_unlocks=_positive_int("MAX_ACTIVE_UNLOCKS", 2),
+        upload_work_multiplier=_positive_int("UPLOAD_WORK_MULTIPLIER", 3),
         chunk_read_timeout_seconds=_positive_int("UPLOAD_CHUNK_TIMEOUT_SECONDS", 180),
         sweep_interval_seconds=_positive_int("SWEEP_INTERVAL_SECONDS", 300),
         max_invite_ttl_seconds=_positive_int("MAX_INVITE_TTL_SECONDS", 7 * 24 * 3600),

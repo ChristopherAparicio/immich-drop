@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,8 @@ from fastapi.testclient import TestClient
 
 from app.app import CSRF_COOKIE, create_app
 from app.config import MARKER_NAME, MARKER_VALUE, Settings, load_settings
-from app.storage import InsufficientStorage, InviteSpec, QuotaExceeded, StorageError, Store
+from app.storage import (InsufficientStorage, InviteSpec, QuotaExceeded, StorageError,
+                         Store, UnsupportedType)
 from dropctl import main as cli_main, parser, read_password
 
 ORIGIN = "https://drop.test"
@@ -216,6 +218,246 @@ def test_concurrent_duplicate_patch_is_serialized(settings: Settings):
     assert sorted(results)==["offset_conflict","ok"]
     assert store.get_upload(upload["id"])["status"]=="complete"
 
+def test_same_invite_deduplicates_content_and_releases_quota(client: TestClient, invitation, settings: Settings):
+    store,token,invite_id=invitation; assert unlock(client,token).status_code==204
+    data=b"\xff\xd8\xff"+b"same-photo"*100
+    first=create_upload(client,token,"first.jpg",data)
+    assert patch(client,first["uploadUrl"],0,data).headers["upload-state"]=="complete"
+    with store.connect() as conn:
+        before_complete_replay=conn.execute("SELECT ingress_requests,ingress_bytes FROM invites WHERE id=?",(invite_id,)).fetchone()
+    complete_replay=patch(client,first["uploadUrl"],0,data)
+    assert complete_replay.status_code==409 and complete_replay.headers["upload-state"]=="complete"
+    with store.connect() as conn:
+        after_complete_replay=conn.execute("SELECT ingress_requests,ingress_bytes FROM invites WHERE id=?",(invite_id,)).fetchone()
+    assert tuple(after_complete_replay)==(before_complete_replay["ingress_requests"]+1,
+                                          before_complete_replay["ingress_bytes"]+len(data))
+    second=create_upload(client,token,"renamed.jpeg",data)
+    duplicate=patch(client,second["uploadUrl"],0,data)
+    assert duplicate.status_code==204 and duplicate.headers["upload-state"]=="duplicate"
+    receipt=client.head(second["uploadUrl"])
+    assert receipt.status_code==204 and receipt.headers["upload-state"]=="duplicate"
+    assert receipt.headers["upload-offset"]==str(len(data))
+    with store.connect() as conn:
+        before_duplicate_replay=conn.execute("SELECT ingress_requests,ingress_bytes FROM invites WHERE id=?",(invite_id,)).fetchone()
+    replay=patch(client,second["uploadUrl"],0,data)
+    assert replay.status_code==409 and replay.headers["upload-state"]=="duplicate"
+    assert replay.headers["upload-offset"]==str(len(data))
+    with store.connect() as conn:
+        after_duplicate_replay=conn.execute("SELECT ingress_requests,ingress_bytes FROM invites WHERE id=?",(invite_id,)).fetchone()
+        assert tuple(after_duplicate_replay)==(before_duplicate_replay["ingress_requests"]+1,
+                                               before_duplicate_replay["ingress_bytes"]+len(data))
+        assert conn.execute("SELECT COUNT(*) FROM uploads WHERE invite_id=? AND status='complete'",(invite_id,)).fetchone()[0]==1
+        assert conn.execute("SELECT COALESCE(SUM(reserved_bytes),0) FROM uploads WHERE invite_id=?",(invite_id,)).fetchone()[0]==len(data)
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts WHERE invite_id=?",(invite_id,)).fetchone()[0]==1
+    manifest=json.loads((settings.incoming_root/invite_id/"manifest.json").read_text())
+    assert len(manifest["files"])==1 and manifest["files"][0]["originalName"]=="first.jpg"
+    assert len(list((settings.incoming_root/invite_id/"completed").iterdir()))==1
+    listed=next(row for row in store.list_invites() if row["id"]==invite_id)
+    assert listed["files"]==1 and listed["bytes"]==len(data)
+
+def test_deduplication_is_scoped_to_one_invitation(settings: Settings):
+    store=Store(settings); store.initialize(); data=b"\xff\xd8\xffshared-content"
+    ids=[]
+    for index in range(2):
+        token=f"separate-invite-token-{index}-1234"
+        invite_id=store.create_invite(token,"password",InviteSpec(f"Invite {index}",f"Invite {index}","photos",int(time.time())+60,1000,2,1500))
+        upload=store.reserve_upload(store.find_invite(token),f"photo-{index}.jpg",len(data))
+        assert store.append(upload,0,data)["status"]=="complete"
+        ids.append(invite_id)
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM uploads WHERE status='complete'").fetchone()[0]==2
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts").fetchone()[0]==0
+    assert all(len(list((settings.incoming_root/invite_id/"completed").iterdir()))==1 for invite_id in ids)
+
+def test_concurrent_identical_completions_choose_one_canonical(settings: Settings):
+    store=Store(settings); store.initialize(); token="dedup-race-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Dedup race","Dedup race","photos",int(time.time())+60,1000,2,1500))
+    data=b"\xff\xd8\xff"+b"r"*100
+    uploads=[store.reserve_upload(store.find_invite(token),f"race-{index}.jpg",len(data)) for index in range(2)]
+    barrier=threading.Barrier(2)
+    def finish(upload):
+        barrier.wait(); return store.append(upload,0,data)["status"]
+    with ThreadPoolExecutor(max_workers=2) as pool: states=list(pool.map(finish,uploads))
+    assert sorted(states)==["complete","duplicate"]
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM uploads WHERE status='complete'").fetchone()[0]==1
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts").fetchone()[0]==1
+    assert len(list((settings.incoming_root/invite_id/"completed").iterdir()))==1
+    assert len(json.loads((settings.incoming_root/invite_id/"manifest.json").read_text())["files"])==1
+
+def test_duplicate_receipts_are_bounded_and_swept(settings: Settings):
+    store=Store(settings); store.initialize(); token="bounded-dedup-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Bounded dedup","Bounded dedup","photos",int(time.time())+60,1000,2,1500))
+    data=b"\xff\xd8\xffbounded"
+    for index in range(6):
+        upload=store.reserve_upload(store.find_invite(token),f"same-{index}.jpg",len(data))
+        store.append(upload,0,data)
+    with pytest.raises(QuotaExceeded,match="attempt budget"):
+        store.reserve_upload(store.find_invite(token),"same-again.jpg",len(data))
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts WHERE invite_id=?",(invite_id,)).fetchone()[0]<=2
+        conn.execute("UPDATE duplicate_receipts SET expires_at=0 WHERE invite_id=?",(invite_id,))
+    assert store.sweep()>=1
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts WHERE invite_id=?",(invite_id,)).fetchone()[0]==0
+
+def test_ingress_work_budget_is_monotonic(settings: Settings):
+    limited=Settings(**{**settings.__dict__,"upload_work_multiplier":2})
+    store=Store(limited); store.initialize(); token="ingress-budget-token-1234"
+    store.create_invite(token,"password",InviteSpec("Ingress","Ingress","photos",int(time.time())+60,100,10,100))
+    for index in range(2):
+        upload=store.reserve_upload(store.find_invite(token),f"charged-{index}.jpg",100)
+        store.reserve_ingress(upload,100); store.delete_upload(upload)
+    exhausted=store.reserve_upload(store.find_invite(token),"exhausted.jpg",100)
+    with pytest.raises(QuotaExceeded,match="work budget"): store.reserve_ingress(exhausted,100)
+    with store.connect() as conn:
+        invite=conn.execute("SELECT ingress_bytes,ingress_byte_limit FROM invites").fetchone()
+    assert tuple(invite)==(200,200)
+
+def test_rejected_upload_creations_consume_attempt_budget(settings: Settings):
+    limited=Settings(**{**settings.__dict__,"upload_work_multiplier":3})
+    store=Store(limited); store.initialize(); token="rejected-attempt-token-1234"
+    store.create_invite(token,"password",InviteSpec("Attempts","Attempts","photos",int(time.time())+60,100,1,100))
+    assert store.reserve_upload(store.find_invite(token),"accepted.jpg",100)
+    with pytest.raises(QuotaExceeded,match="quota"):
+        store.reserve_upload(store.find_invite(token),"quota-full.jpg",100)
+    with pytest.raises(UnsupportedType):
+        store.reserve_upload(store.find_invite(token),"forbidden.zip",100)
+    with pytest.raises(QuotaExceeded,match="attempt budget"):
+        store.reserve_upload(store.find_invite(token),"exhausted.jpg",100)
+    with store.connect() as conn:
+        invite=conn.execute("SELECT ingress_attempts,ingress_attempt_limit FROM invites").fetchone()
+    assert tuple(invite)==(3,3)
+
+def test_concurrent_rejected_creations_cannot_exceed_attempt_budget(settings: Settings):
+    limited=Settings(**{**settings.__dict__,"upload_work_multiplier":1})
+    store=Store(limited); store.initialize(); token="attempt-race-token-1234"
+    store.create_invite(token,"password",InviteSpec("Attempt race","Attempt race","photos",int(time.time())+60,100,10,1000))
+    barrier=threading.Barrier(20)
+    def reject(_index):
+        barrier.wait()
+        try:
+            store.reserve_upload(store.find_invite(token),"forbidden.zip",100)
+        except UnsupportedType:
+            return "charged"
+        except QuotaExceeded:
+            return "exhausted"
+    with ThreadPoolExecutor(max_workers=20) as pool: results=list(pool.map(reject,range(20)))
+    assert results.count("charged")==10 and results.count("exhausted")==10
+    with store.connect() as conn:
+        invite=conn.execute("SELECT ingress_attempts,ingress_attempt_limit FROM invites").fetchone()
+        uploads=conn.execute("SELECT COUNT(*) FROM uploads").fetchone()[0]
+    assert tuple(invite)==(10,10) and uploads==0
+
+def test_ingress_request_budget_bounds_tiny_invalid_chunks(settings: Settings):
+    limited=Settings(**{**settings.__dict__,"upload_work_multiplier":1})
+    store=Store(limited); store.initialize(); token="request-budget-token-1234"
+    store.create_invite(token,"password",InviteSpec("Requests","Requests","photos",int(time.time())+60,100,1,100))
+    upload=store.reserve_upload(store.find_invite(token),"tiny.jpg",100)
+    store.reserve_ingress(upload,1); store.reserve_ingress(upload,1)
+    with pytest.raises(QuotaExceeded,match="work budget"): store.reserve_ingress(upload,1)
+    with store.connect() as conn:
+        invite=conn.execute("SELECT ingress_requests,ingress_request_limit FROM invites").fetchone()
+    assert tuple(invite)==(2,2)
+
+def test_concurrent_sweeps_are_idempotent(settings: Settings):
+    store=Store(settings); store.initialize(); token="sweep-race-token-1234"
+    store.create_invite(token,"password",InviteSpec("Sweep race","Sweep race","photos",int(time.time())+60,1000,2,1500))
+    upload=store.reserve_upload(store.find_invite(token),"old.jpg",100)
+    with store.connect(True) as conn: conn.execute("UPDATE uploads SET updated_at=0 WHERE id=?",(upload["id"],))
+    barrier=threading.Barrier(2); original=store.upload_lock
+    @contextmanager
+    def synchronized(row):
+        barrier.wait()
+        with original(row): yield
+    store.upload_lock=synchronized
+    with ThreadPoolExecutor(max_workers=2) as pool: results=list(pool.map(lambda _:store.sweep(now=1000),range(2)))
+    assert sorted(results)==[0,1]
+
+def test_reconcile_removes_orphan_receipt_locks(settings: Settings):
+    store=Store(settings); store.initialize(); token="orphan-lock-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Orphan lock","Orphan lock","photos",int(time.time())+60,1000,2,1500))
+    lock_dir=settings.incoming_root/invite_id/".locks"; lock_dir.mkdir(mode=0o700,parents=True)
+    orphan=lock_dir/"00000000-0000-4000-8000-000000000000.lock"; orphan.write_bytes(b"")
+    result=store.reconcile()
+    assert result["removed"]>=1 and not orphan.exists()
+
+def test_reconcile_deduplicates_file_renamed_before_crash(settings: Settings):
+    store=Store(settings); store.initialize(); token="dedup-crash-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Dedup crash","Dedup crash","photos",int(time.time())+60,1000,3,1500))
+    data=b"\xff\xd8\xffcrash-duplicate"
+    first=store.reserve_upload(store.find_invite(token),"first.jpg",len(data)); store.append(first,0,data)
+    second=store.reserve_upload(store.find_invite(token),"second.jpg",len(data))
+    partial,completed=store.paths(invite_id,second["id"],second["extension"])
+    partial.write_bytes(data); os.replace(partial,completed)
+    assert store.reconcile()["fixed"]>=1
+    assert store.get_upload(second["id"])["status"]=="duplicate"
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM uploads WHERE status='complete'").fetchone()[0]==1
+    assert len(list((settings.incoming_root/invite_id/"completed").iterdir()))==1
+
+def test_reconcile_preserves_legacy_completed_duplicates_for_rollback_safety(settings: Settings):
+    store=Store(settings); store.initialize(); token="legacy-dedup-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Legacy dedup","Legacy dedup","photos",int(time.time())+60,1000,3,1500))
+    data=b"\xff\xd8\xfflegacy-duplicate"; digest=hashlib.sha256(data).hexdigest()
+    first=store.reserve_upload(store.find_invite(token),"first.jpg",len(data)); store.append(first,0,data)
+    second=store.reserve_upload(store.find_invite(token),"second.jpg",len(data))
+    partial,completed=store.paths(invite_id,second["id"],second["extension"])
+    partial.write_bytes(data); os.replace(partial,completed)
+    with store.connect(True) as conn:
+        conn.execute("""UPDATE uploads SET offset=declared_size,status='complete',sha256=?,completed_at=?,updated_at=?
+            WHERE id=?""",(digest,int(time.time()),int(time.time()),second["id"]))
+    store.reconcile()
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM uploads WHERE status='complete'").fetchone()[0]==2
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts").fetchone()[0]==0
+    assert len(list((settings.incoming_root/invite_id/"completed").iterdir()))==2
+
+def test_v011_schema_upgrade_remains_rollback_writable(settings: Settings):
+    with sqlite3.connect(settings.state_db) as conn:
+        conn.executescript("""
+            CREATE TABLE invites (
+                id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+                name TEXT NOT NULL, target_folder TEXT NOT NULL, profile TEXT NOT NULL,
+                expires_at INTEGER NOT NULL, closed_at INTEGER, max_file_bytes INTEGER NOT NULL,
+                max_files INTEGER NOT NULL, quota_bytes INTEGER NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE uploads (
+                id TEXT PRIMARY KEY, invite_id TEXT NOT NULL REFERENCES invites(id),
+                original_name TEXT NOT NULL, extension TEXT NOT NULL, category TEXT NOT NULL,
+                declared_size INTEGER NOT NULL, offset INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL, reserved_bytes INTEGER NOT NULL, sha256 TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, completed_at INTEGER);
+            CREATE UNIQUE INDEX uploads_one_content_per_invite
+                ON uploads(invite_id,declared_size,category,sha256)
+                WHERE status='complete' AND sha256 IS NOT NULL;
+        """)
+    Store(settings).initialize()
+    invite_id="00000000-0000-4000-8000-000000000001"; now=int(time.time()); digest="a"*64
+    with sqlite3.connect(settings.state_db) as conn:
+        # These are the explicit v0.1.1 INSERT shapes. New additive columns must
+        # keep defaults and no uniqueness constraint may reject old completions.
+        conn.execute("""INSERT INTO invites
+            (id,token_hash,password_hash,name,target_folder,profile,expires_at,max_file_bytes,max_files,quota_bytes,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",(invite_id,"legacy-token","legacy-password","Legacy","Legacy","photos",now+60,1000,5,5000,now))
+        for index in range(2):
+            conn.execute("""INSERT INTO uploads
+                (id,invite_id,original_name,extension,category,declared_size,offset,status,reserved_bytes,sha256,created_at,updated_at,completed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",(f"00000000-0000-4000-8000-00000000001{index}",invite_id,
+                f"legacy-{index}.jpg",".jpg","photo",10,10,"complete",10,digest,now,now,now))
+        indexes={row[1] for row in conn.execute("PRAGMA index_list('uploads')")}
+    assert "uploads_one_content_per_invite" not in indexes
+
+def test_only_manifest_writer_removes_manifest_temporaries(settings: Settings):
+    store=Store(settings); store.initialize(); token="manifest-temp-owner"
+    invite_id=store.create_invite(token,"password",InviteSpec("Manifest temp","Manifest temp","photos",int(time.time())+60,1000,2,1500))
+    data=b"\xff\xd8\xffvalid"; upload=store.reserve_upload(store.find_invite(token),"x.jpg",len(data)); store.append(upload,0,data)
+    temporary=settings.incoming_root/invite_id/".manifest-active.tmp"; temporary.write_bytes(b"in progress")
+    store._remove_orphans_without_following_symlinks(set())
+    assert temporary.exists()
+    store.write_manifest(invite_id)
+    assert not temporary.exists()
+    assert json.loads((settings.incoming_root/invite_id/"manifest.json").read_text())["files"]
+
 def test_non_final_chunks_must_be_exactly_8_mib(settings: Settings):
     store=Store(settings); store.initialize(); token="exact-chunk"
     store.create_invite(token,"password",InviteSpec("Exact","Exact","photos",int(time.time())+60,9_000_000,2,9_500_000))
@@ -266,7 +508,7 @@ def test_reconcile_io_error_preserves_completed_candidate(settings: Settings,mon
 
 def test_cancel_and_reject_cycles_remain_bounded(settings: Settings):
     store=Store(settings); store.initialize(); token="bounded-cycles"
-    invite_id=store.create_invite(token,"password",InviteSpec("Bounded","Bounded","photos",int(time.time())+60,1000,1,1500))
+    invite_id=store.create_invite(token,"password",InviteSpec("Bounded","Bounded","photos",int(time.time())+60,1000,50,1500))
     for index in range(20):
         upload=store.reserve_upload(store.find_invite(token),f"cancel-{index}.jpg",10)
         store.delete_upload(upload)

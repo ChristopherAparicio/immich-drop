@@ -23,6 +23,11 @@ must remain inside that invitation's immutable limits.
 - Expiry, byte quota, file count, media profile, and per-file ceiling are
   mandatory and finite.
 - Quotas are reserved transactionally, including concurrent requests.
+- Immutable per-invitation attempt and ingress budgets bound cumulative storage
+  work, including policy/quota-rejected upload creations and cancelled,
+  malformed, timed-out, or duplicate chunk submissions. Schema-invalid JSON is
+  rejected before storage work and remains subject to the mandatory edge rate
+  and body-size limits.
 - Disk paths use UUIDs; user filenames are bounded metadata and never joined
   into paths.
 - Upload data is processed one fixed, bounded eight-MiB chunk at a time and is
@@ -30,6 +35,9 @@ must remain inside that invitation's immutable limits.
 - Extension and media signature must agree. SVG, documents, archives,
   executables, and unknown content are refused.
 - Completed files cannot be listed, previewed, or downloaded publicly.
+- Server-computed hashes deduplicate only completed files inside one
+  invitation. Temporary replay receipts contain no media, release quota, and
+  are both time-limited and count-limited.
 - Sessions are invitation-scoped; state changes require same-origin requests
   and a CSRF token.
 - Browser resume metadata is AES-GCM encrypted with a key derived from the
@@ -54,6 +62,10 @@ connection, request-rate, body-size, and timeout controls.
 Mobile browsers, especially iOS, may suspend background JavaScript. Resumable
 uploads allow a user to continue later; they do not guarantee uninterrupted
 background transfer.
+
+Deduplication does not prevent repeated ingress traffic because the service
+must receive and validate the whole object before trusting its hash. No public
+hash lookup or cross-invitation comparison exists.
 
 ## Security invariants
 

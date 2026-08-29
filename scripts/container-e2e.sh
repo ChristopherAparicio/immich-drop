@@ -128,6 +128,31 @@ with httpx.Client(base_url=origin, follow_redirects=False) as client:
     assert head.headers["Upload-State"] == "complete"
     assert client.get(upload_url).status_code == 405
 
+    duplicate = client.post(
+        f"/drop/api/invites/{token}/uploads",
+        json={"name": "renamed-event.jpeg", "size": len(data)}, headers=headers,
+    )
+    assert duplicate.status_code == 201
+    duplicate_url = duplicate.json()["uploadUrl"]
+    offset = 0
+    for chunk in (data[:8 * 1024 * 1024], data[8 * 1024 * 1024:]):
+        chunk_headers = {
+            **headers,
+            "Content-Type": "application/offset+octet-stream",
+            "Upload-Offset": str(offset),
+            "Upload-Checksum": "sha256 " + base64.b64encode(
+                hashlib.sha256(chunk).digest()
+            ).decode(),
+        }
+        duplicate_response = client.patch(duplicate_url, content=chunk, headers=chunk_headers)
+        assert duplicate_response.status_code == 204
+        offset = int(duplicate_response.headers["Upload-Offset"])
+    assert duplicate_response.headers["Upload-State"] == "duplicate"
+    duplicate_head = client.head(duplicate_url)
+    assert duplicate_head.status_code == 204
+    assert duplicate_head.headers["Upload-State"] == "duplicate"
+    assert int(duplicate_head.headers["Upload-Offset"]) == len(data)
+
 closed = json.loads(subprocess.run(
     ["docker", "exec", name, "python", "-m", "app.cli", "close", opened["id"], "--json"],
     check=True, capture_output=True, text=True,
@@ -136,20 +161,22 @@ assert closed["closed"] is True
 
 inspection = json.loads(subprocess.run(
     ["docker", "exec", name, "python", "-c",
-     "import json,pathlib; f=list(pathlib.Path('/incoming').glob('*/completed/*.jpg')); "
+     "import json,pathlib,sqlite3; f=list(pathlib.Path('/incoming').glob('*/completed/*')); "
      "m=list(pathlib.Path('/incoming').glob('*/manifest.json')); "
-     "print(json.dumps({'files':len(f),'manifests':len(m),'bytes':f[0].stat().st_size}))"],
+     "c=sqlite3.connect('/data/state.db'); r=c.execute('SELECT COUNT(*) FROM duplicate_receipts').fetchone()[0]; "
+     "print(json.dumps({'files':len(f),'manifests':len(m),'bytes':f[0].stat().st_size,'receipts':r}))"],
     check=True, capture_output=True, text=True,
 ).stdout)
-assert inspection == {"files": 1, "manifests": 1, "bytes": 8 * 1024 * 1024 + 257}
+assert inspection == {"files": 1, "manifests": 1, "bytes": 8 * 1024 * 1024 + 257, "receipts": 0}
 
 logs_result = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
 logs = logs_result.stdout + logs_result.stderr
 assert token not in logs and password not in logs
 print(json.dumps({
-    "chunks": 2,
+    "chunks": 4,
     "containerE2E": "passed",
     "credentialLeakInLogs": False,
+    "deduplication": "passed",
     "uploadedBytes": inspection["bytes"],
 }, sort_keys=True))
 PY

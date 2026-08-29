@@ -37,12 +37,22 @@ administration, filesystem, debug, or download route.
 2. The visitor opens the opaque URL and unlocks it over HTTPS. Authentication
    creates a short-lived, scoped, `Secure`, `HttpOnly` session.
 3. Creating an upload reserves one file slot and its declared byte count in a
-   transaction before the first chunk is accepted.
+   transaction before the first chunk is accepted. Every authenticated upload
+   creation reaching policy evaluation consumes one unit from an immutable
+   cumulative attempt budget, including requests rejected by type, size, quota,
+   global budget, or disk reserve checks.
 4. A fixed-size resumable stream is appended at the exact server-reported
-   offset to a server-generated `.part` path.
+   offset to a server-generated `.part` path. Every declared chunk is charged
+   to immutable cumulative request and ingress-byte budgets before its body is
+   read, so repeated tiny invalid chunks are also finite.
 5. The completed object is checked against both the policy extension and media
-   signature, synced, and renamed atomically into `completed/`.
-6. A separate trusted local process may review and import accepted files into
+   signature, synced, hashed, and renamed atomically into `completed/`.
+6. Under a serialized SQLite transaction, the first matching
+   `(invitation, size, category, SHA-256)` becomes canonical. A later match is
+   removed, its quota reservation is released, and a bounded expiring receipt
+   preserves `HEAD`/replay semantics after a lost final response. The manifest
+   contains only canonical files.
+7. A separate trusted local process may review and import accepted files into
    Immich. This action is never triggered by an Internet request.
 
 ## Failure behaviour
@@ -55,6 +65,8 @@ administration, filesystem, debug, or download route.
   rejected without exposing a filesystem path.
 - A slow client exceeds the absolute per-chunk deadline and releases its
   bounded application concurrency slot.
+- Duplicate detection happens only after the complete upload. It does not
+  reduce ingress bandwidth and never crosses an invitation boundary.
 - VPS-to-NAS tunnel or NAS filter unavailable: public upload routes fail
   closed.
 

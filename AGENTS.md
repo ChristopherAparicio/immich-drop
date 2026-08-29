@@ -17,6 +17,10 @@ Immich as separate trust zones.
   marker-backed root.
 - Quota reservation, exact-offset writes, completion, cancellation, closure,
   and expiry must remain race-safe. Partial uploads count against quotas.
+- Content deduplication is server-verified only after completion and is scoped
+  to one invitation. Never add a client-hash lookup oracle, cross-invitation
+  deduplication, hard links, unbounded duplicate receipts, or a path that
+  bypasses the invitation's monotonic attempt/ingress work budgets.
 - Never log tokens, passwords, cookies, filenames, paths, query strings, or raw
   request targets. Test upstream-error logging as well as normal requests.
 - No CDN, analytics, external font, remote script, service worker, or telemetry
