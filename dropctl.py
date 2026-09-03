@@ -9,12 +9,11 @@ import os
 import secrets
 import string
 import stat
-import sys
 import time
 from pathlib import Path
 
 from app.config import MAX_PASSWORD_BYTES, MARKER_NAME, MARKER_VALUE, load_settings
-from app.storage import InviteSpec, Store
+from app.storage import InviteSpec, StorageError, Store
 
 def duration(value: str) -> int:
     units = {"m":60,"h":3600,"d":86400,"w":604800}
@@ -86,6 +85,12 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 def main(argv: list[str] | None = None) -> int:
+    # Operator-facing failures are one clean line on stderr and exit status 1,
+    # never a traceback (which would print the state or staging paths).
+    try: return _run(argv)
+    except StorageError as exc: raise SystemExit(f"dropctl: {exc}") from exc
+
+def _run(argv: list[str] | None) -> int:
     args = parser().parse_args(argv); cfg = load_settings()
     if args.command == "init":
         if not args.yes: raise SystemExit("init requires --yes after verifying INCOMING_ROOT is the mounted staging volume")
@@ -136,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "sweep":
         reconciled = store.reconcile(); swept = store.sweep()
         if args.json: print(json.dumps({"reconciled":reconciled,"swept":swept},separators=(",",":"),sort_keys=True))
-        else: print(f"Reconciled: {reconciled['fixed']} fixed, {reconciled['removed']} orphan files removed; swept: {swept}")
+        else: print(f"Reconciled: {reconciled['fixed']} fixed, {reconciled['removed']} stray files removed, "
+                    f"{reconciled['orphaned']} completed files moved to orphaned/; swept: {swept}")
     elif args.command == "purge":
         if not args.yes:
             answer = input(f"Permanently delete invitation {args.invite_id} and all staged files? [y/N] ")

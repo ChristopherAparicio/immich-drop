@@ -17,11 +17,12 @@ from anyio import CapacityLimiter, WouldBlock, create_task_group, fail_after, sl
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from app.config import MAX_PASSWORD_BYTES, Settings, load_settings
+from app.logsafe import install_redaction
 from app.storage import (PROFILE_EXTENSIONS, Conflict, NotFound, StorageError, Store,
                          Unauthorized, token_digest)
 
@@ -35,7 +36,8 @@ class UnlockBody(BaseModel):
 class UploadBody(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     name: str = Field(min_length=1, max_length=255)
-    size: int = Field(gt=0)
+    # Strict: a float or numeric string must be a 422, never coerced to an int.
+    size: StrictInt = Field(gt=0)
     last_modified: int | None = Field(default=None, alias="lastModified")
 
 def _error(status: int, code: str, message: str | None = None, headers: dict[str,str] | None = None) -> JSONResponse:
@@ -60,7 +62,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         current = configured or load_settings()
         current.validate()
         logging.basicConfig(level=current.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-        store = Store(current); store.initialize(); store.reconcile(); store.sweep()
+        install_redaction()
+        store = Store(current); store.initialize(); reconciled = store.reconcile(); swept = store.sweep()
+        logger.info("startup action=reconcile fixed=%s removed=%s orphaned=%s swept=%s",
+                    reconciled["fixed"], reconciled["removed"], reconciled["orphaned"], swept)
         application.state.settings = current; application.state.store = store
         async def maintenance() -> None:
             while True:
@@ -75,8 +80,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
             tasks.cancel_scope.cancel()
 
+    # redirect_slashes=False: a 307 would echo the internal Host header as an
+    # absolute Location and hand the visitor a second, unfiltered URL shape.
     application = FastAPI(title="Immich Drop Staging", docs_url=None, redoc_url=None,
-                          openapi_url=None, lifespan=lifespan)
+                          openapi_url=None, lifespan=lifespan, redirect_slashes=False)
     # The only signed authentication state is an opaque invite UUID and expiry.
     secret = settings.session_secret if settings else "x" * 32
     max_age = settings.session_max_age_seconds if settings else 12 * 3600
@@ -113,24 +120,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not hmac.compare_digest(expected, cookie) or not hmac.compare_digest(expected, header):
             raise StorageError("CSRF validation failed")
 
-    def invite_for_session(request: Request, token: str):
+    # Every Store call touches SQLite (busy_timeout up to 15 s) or a per-upload
+    # flock. None of them may run on the event loop, or one stalled upload
+    # would freeze every other request including /healthz.
+    async def invite_for_session(request: Request, token: str):
         _validate_token(token)
-        store = get_store(request); invite = store.find_invite(token); store.ensure_open(invite)
+        store = get_store(request)
+        invite = await run_in_threadpool(store.find_invite, token); store.ensure_open(invite)
         auth = request.session.get("invite")
         if not isinstance(auth, dict) or auth.get("id") != invite["id"] or auth.get("until", 0) < int(time.time()):
             raise Unauthorized()
         return invite
 
-    def upload_for_session(request: Request, upload_id: str):
+    async def upload_for_session(request: Request, upload_id: str):
         _validate_upload_id(upload_id)
-        upload = get_store(request).get_upload(upload_id)
+        store = get_store(request)
+        upload = await run_in_threadpool(store.get_upload, upload_id)
         auth = request.session.get("invite")
         if not isinstance(auth, dict) or auth.get("id") != upload["invite_id"] or auth.get("until", 0) < int(time.time()):
             raise NotFound()
-        with get_store(request).connect() as conn:
-            invite = conn.execute("SELECT * FROM invites WHERE id=?", (upload["invite_id"],)).fetchone()
+        invite = await run_in_threadpool(store.get_invite, upload["invite_id"])
         if invite is None: raise NotFound()
-        get_store(request).ensure_open(invite)
+        store.ensure_open(invite)
         return upload
 
     @application.exception_handler(StorageError)
@@ -143,11 +154,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # include a password or visitor filename, so expose only a stable code.
         return _error(422, "invalid_request")
 
+    @application.exception_handler(OSError)
+    async def storage_failure(_request: Request, exc: OSError):
+        # Filesystem failures carry the staging path in ``filename``. Handling
+        # them here (ExceptionMiddleware) answers generically and does NOT
+        # re-raise, so the server never receives a traceback to log.
+        logger.error("request failed status=500 exception=%s", type(exc).__name__)
+        return _error(500, "internal_error")
+
     @application.exception_handler(Exception)
-    async def unexpected_error(_request: Request, _exc: Exception):
+    async def unexpected_error(_request: Request, exc: Exception):
         # Paths and invite credentials can be present in exception strings. Keep
-        # the public response and the runtime log deliberately generic.
-        logger.error("request failed status=500")
+        # the public response and the runtime log deliberately generic. Starlette
+        # re-raises after this handler; the server's log config redacts it.
+        logger.error("request failed status=500 exception=%s", type(exc).__name__)
         return _error(500, "internal_error")
 
     @application.middleware("http")
@@ -204,7 +224,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get("/drop/api/invites/{token}/policy")
     async def policy(request: Request, token: str):
         _validate_token(token)
-        store = get_store(request); invite = store.find_invite(token); store.ensure_open(invite)
+        store = get_store(request)
+        invite = await run_in_threadpool(store.find_invite, token); store.ensure_open(invite)
         auth = request.session.get("invite")
         if not isinstance(auth, dict) or auth.get("id") != invite["id"] or auth.get("until", 0) < int(time.time()):
             response = _error(Unauthorized.status, Unauthorized.code)
@@ -224,7 +245,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def unlock(request: Request, token: str, body: UnlockBody):
         require_mutation(request)
         _validate_token(token)
-        store = get_store(request); invite = store.find_invite(token); store.ensure_open(invite)
+        store = get_store(request)
+        invite = await run_in_threadpool(store.find_invite, token); store.ensure_open(invite)
         key = token_digest(token); now = time.monotonic(); bucket = attempts[key]
         while bucket and bucket[0] < now - 300: bucket.popleft()
         if len(bucket) >= 5: return _error(429, "too_many_attempts", headers={"Retry-After":"300"})
@@ -240,8 +262,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.post("/drop/api/invites/{token}/uploads", status_code=201)
     async def create_upload(request: Request, token: str, body: UploadBody):
-        require_mutation(request); invite = invite_for_session(request, token)
-        upload = get_store(request).reserve_upload(invite, body.name, body.size)
+        require_mutation(request); invite = await invite_for_session(request, token)
+        upload = await run_in_threadpool(get_store(request).reserve_upload, invite, body.name, body.size)
         url = f"/drop/api/uploads/{upload['id']}"
         return JSONResponse({"uploadId":upload["id"],"uploadUrl":url,"offset":0,
                              "chunkBytes":get_settings(request).chunk_bytes}, status_code=201,
@@ -249,20 +271,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.head("/drop/api/uploads/{upload_id}")
     async def head_upload(request: Request, upload_id: str):
-        upload = upload_for_session(request, upload_id)
+        upload = await upload_for_session(request, upload_id)
         return Response(status_code=204, headers={"Upload-Offset":str(upload["offset"]),
             "Upload-Length":str(upload["declared_size"]),"Upload-State":_public_state(upload["status"])})
 
     @application.patch("/drop/api/uploads/{upload_id}")
     async def patch_upload(request: Request, upload_id: str):
-        require_mutation(request); upload = upload_for_session(request, upload_id)
+        require_mutation(request); upload = await upload_for_session(request, upload_id)
         raw_length=request.headers.get("content-length"); charged_bytes=0
         try:
             parsed_for_charge=int(raw_length) if raw_length is not None else 0
             if parsed_for_charge>0: charged_bytes=min(parsed_for_charge,get_settings(request).chunk_bytes)
         except ValueError:
             pass
-        get_store(request).reserve_ingress(upload,charged_bytes)
+        await run_in_threadpool(get_store(request).reserve_ingress,upload,charged_bytes)
         if request.headers.get("content-type", "").split(";",1)[0].strip().lower() != "application/offset+octet-stream":
             return _error(415,"unsupported_media_type")
         if request.headers.get("transfer-encoding"): return _error(400,"ambiguous_body_framing")
@@ -299,7 +321,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 result = await run_in_threadpool(get_store(request).append,upload,expected,bytes(data),checksum)
             except Conflict as exc:
-                current=get_store(request).get_upload(upload_id)
+                current=await run_in_threadpool(get_store(request).get_upload,upload_id)
                 return _error(409,exc.code,str(exc),headers={"Upload-Offset":str(current["offset"]),
                     "Upload-Length":str(current["declared_size"]),"Upload-State":_public_state(current["status"])})
             return Response(status_code=204, headers={"Upload-Offset":str(result["offset"]),
@@ -308,8 +330,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.delete("/drop/api/uploads/{upload_id}")
     async def delete_upload(request: Request, upload_id: str):
-        require_mutation(request); upload = upload_for_session(request, upload_id)
-        get_store(request).delete_upload(upload); return Response(status_code=204)
+        require_mutation(request); upload = await upload_for_session(request, upload_id)
+        await run_in_threadpool(get_store(request).delete_upload, upload); return Response(status_code=204)
 
     return application
 

@@ -4,6 +4,7 @@ import base64
 import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -198,7 +199,7 @@ def test_reconcile_sweep_and_orphan_cleanup(settings: Settings):
     upload=store.reserve_upload(store.find_invite(token),"x.jpg",100)
     partial,_=store.paths(upload["invite_id"],upload["id"],upload["extension"]); partial.write_bytes(b"123")
     orphan=partial.parent/"orphan.part"; orphan.write_bytes(b"x")
-    result=store.reconcile(); assert result=={"fixed":1,"removed":1}
+    result=store.reconcile(); assert result=={"fixed":1,"removed":1,"orphaned":0}
     assert store.get_upload(upload["id"])["offset"]==3 and not orphan.exists()
     with store.connect(True) as conn: conn.execute("UPDATE uploads SET updated_at=0 WHERE id=?",(upload["id"],))
     assert store.sweep(now=1000)==1 and not partial.exists()
@@ -693,3 +694,226 @@ def test_cli_json_is_stable_and_does_not_list_tokens(settings: Settings,monkeypa
     assert cli_main(["list","--json"])==0
     listed=json.loads(capsys.readouterr().out); assert listed[0]["active"] is True
     assert "token" not in json.dumps(listed).lower() and "link" not in listed[0]
+
+def test_storage_os_error_is_answered_generically_without_reraise(settings: Settings, caplog):
+    token="os-error-handler-token-1234"; store=Store(settings); store.initialize()
+    store.create_invite(token,"password",InviteSpec("OSError","OSError","photos",int(time.time())+60,1000,2,1500))
+    secret_path=str(settings.incoming_root/"private"/"partial"/"secret.part")
+    caplog.set_level("DEBUG")
+    # raise_server_exceptions is left at its default: a re-raised OSError would
+    # surface here as an exception instead of a response.
+    with TestClient(create_app(settings),base_url=ORIGIN) as c:
+        assert unlock(c,token,"password").status_code==204
+        upload=create_upload(c,token,"photo.jpg",b"\xff\xd8\xff"+b"x"*50)
+        def denied(*_args,**_kwargs): raise PermissionError(errno.EACCES,"Permission denied",secret_path)
+        c.app.state.store.append=denied
+        caplog.clear(); response=patch(c,upload["uploadUrl"],0,b"\xff\xd8\xff"+b"x"*50)
+    assert response.status_code==500 and response.json()["error"]=="internal_error"
+    text="\n".join(record.getMessage() for record in caplog.records)
+    assert "exception=PermissionError" in text and secret_path not in text and "partial" not in text
+    assert all(record.exc_info is None or record.exc_info==(None,None,None) for record in caplog.records)
+
+def test_uvicorn_error_log_never_contains_storage_paths(settings: Settings, capfd, caplog):
+    import httpx
+    import uvicorn
+    from app.logsafe import uvicorn_log_config
+    plain=Settings(**{**settings.__dict__,"public_base_url":"http://drop.test","cookie_secure":False})
+    store=Store(plain); store.initialize(); token="uvicorn-log-token-1234"
+    store.create_invite(token,"password",InviteSpec("Log","Log","photos",int(time.time())+60,1000,3,2000))
+    application=create_app(plain); caplog.set_level("DEBUG",logger="immich_drop")
+    server=uvicorn.Server(uvicorn.Config(application,host="127.0.0.1",port=0,log_config=uvicorn_log_config(),
+                                         access_log=False,lifespan="on"))
+    thread=threading.Thread(target=server.run,daemon=True); thread.start()
+    secret_path=str(plain.incoming_root/"invite"/"partial"/"upload.part")
+    try:
+        deadline=time.time()+10
+        while not server.started and time.time()<deadline and thread.is_alive(): time.sleep(0.05)
+        assert server.started
+        port=server.servers[0].sockets[0].getsockname()[1]
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}",headers={"Origin":"http://drop.test"},timeout=10) as c:
+            assert c.get(f"/drop/api/invites/{token}/policy").status_code==401
+            headers={"X-Drop-CSRF":c.cookies.get(CSRF_COOKIE)}
+            assert c.post(f"/drop/api/invites/{token}/unlock",json={"password":"password"},headers=headers).status_code==204
+            created=c.post(f"/drop/api/invites/{token}/uploads",json={"name":"photo.jpg","size":53},headers=headers)
+            assert created.status_code==201, created.text
+            url=created.json()["uploadUrl"]; live=application.state.store
+            def denied(*_args,**_kwargs): raise PermissionError(errno.EACCES,"Permission denied",secret_path)
+            live.append=denied
+            response=c.patch(url,content=b"\xff\xd8\xff"+b"x"*50,headers={**headers,"Upload-Offset":"0",
+                "Content-Type":"application/offset+octet-stream"})
+            assert response.status_code==500 and response.json()["error"]=="internal_error"
+            # A failure no handler converts still reaches the server layer, which
+            # must log the class name only.
+            def unexpected(*_args,**_kwargs): raise RuntimeError(f"unsafe storage path {secret_path}")
+            live.get_upload=unexpected
+            # uvicorn closes the connection after a re-raised exception; do not
+            # let httpx reuse that socket for the next request.
+            response=c.head(url,headers={**headers,"Connection":"close"})
+            assert response.status_code==500
+            assert c.get("/healthz").status_code==200
+    finally:
+        server.should_exit=True; thread.join(10)
+        for name in ("uvicorn","uvicorn.error","uvicorn.access"):
+            logging.getLogger(name).handlers.clear(); logging.getLogger(name).propagate=True
+    err=capfd.readouterr().err
+    assert "Exception in ASGI application" in err and "exception=RuntimeError" in err
+    assert "Traceback" not in err and secret_path not in err and ".part" not in err and str(plain.incoming_root) not in err
+    app_log="\n".join(record.getMessage() for record in caplog.records)
+    assert "exception=PermissionError" in app_log and secret_path not in app_log
+
+def test_slow_locked_append_does_not_stall_healthz(settings: Settings):
+    store=Store(settings); store.initialize(); token="loop-block-token-1234"
+    store.create_invite(token,"password",InviteSpec("Block","Block","photos",int(time.time())+60,1000,3,2000))
+    with TestClient(create_app(settings),base_url=ORIGIN) as c:
+        assert unlock(c,token,"password").status_code==204
+        data=b"\xff\xd8\xff"+b"x"*50; upload=create_upload(c,token,"slow.jpg",data)
+        live=c.app.state.store; original_write=live._append_locked; original_lock=live.upload_lock
+        entered=threading.Event(); release=threading.Event(); waiting=threading.Event()
+        def slow(*args,**kwargs):
+            # Runs inside append() while the per-upload flock is held.
+            entered.set(); assert release.wait(5)
+            return original_write(*args,**kwargs)
+        @contextmanager
+        def observed_lock(row):
+            if entered.is_set(): waiting.set()
+            with original_lock(row): yield
+        live._append_locked=slow; live.upload_lock=observed_lock
+        headers={"Origin":ORIGIN,"X-Drop-CSRF":csrf(c)}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writing=pool.submit(patch,c,upload["uploadUrl"],0,data)
+            assert entered.wait(5)
+            # This DELETE blocks on the per-upload flock held by the slow append.
+            cancelling=pool.submit(c.delete,upload["uploadUrl"],headers=headers)
+            assert waiting.wait(5)
+            started=time.monotonic(); health=c.get("/healthz"); elapsed=time.monotonic()-started
+            release.set()
+            assert health.status_code==200 and elapsed<1.0
+            assert writing.result(timeout=5).status_code==204
+            assert cancelling.result(timeout=5).status_code==409
+
+def test_reconcile_moves_unknown_completed_files_to_orphaned(settings: Settings, caplog):
+    store=Store(settings); store.initialize(); token="orphan-completed-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Orphan","Orphan","photos",int(time.time())+60,1000,3,2000))
+    data=b"\xff\xd8\xffkeep"; upload=store.reserve_upload(store.find_invite(token),"keep.jpg",len(data)); store.append(upload,0,data)
+    completed_dir=settings.incoming_root/invite_id/"completed"
+    unknown=completed_dir/"00000000-0000-4000-8000-0000000000aa.jpg"; unknown.write_bytes(b"\xff\xd8\xfflost-row")
+    stray=settings.incoming_root/invite_id/"partial"/"00000000-0000-4000-8000-0000000000bb.part"; stray.write_bytes(b"x")
+    caplog.set_level("WARNING"); result=store.reconcile()
+    assert result=={"fixed":0,"removed":1,"orphaned":1}
+    assert not unknown.exists() and not stray.exists()
+    moved=settings.incoming_root/invite_id/"orphaned"/unknown.name
+    assert moved.read_bytes()==b"\xff\xd8\xfflost-row" and moved.parent.stat().st_mode&0o077==0
+    assert [path.name for path in completed_dir.iterdir()]==[f"{upload['id']}.jpg"]
+    text="\n".join(record.getMessage() for record in caplog.records)
+    assert "orphan_completed count=1" in text and unknown.name not in text and str(settings.incoming_root) not in text
+    assert store.reconcile()=={"fixed":0,"removed":0,"orphaned":0} and moved.exists()
+    unknown.write_bytes(b"again"); assert store.reconcile()["orphaned"]==1
+    assert len(list(moved.parent.iterdir()))==2 and moved.read_bytes()==b"\xff\xd8\xfflost-row"
+
+def test_write_failure_rolls_partial_back_to_committed_offset(settings: Settings, monkeypatch):
+    store=Store(settings); store.initialize(); token="eio-rollback-token-1234"
+    store.create_invite(token,"password",InviteSpec("EIO","EIO","photos",int(time.time())+60,1000,2,1500))
+    data=b"\xff\xd8\xff"+b"e"*100
+    upload=store.reserve_upload(store.find_invite(token),"x.jpg",len(data))
+    partial,_=store.paths(upload["invite_id"],upload["id"],upload["extension"])
+    real_fsync=os.fsync; failures=[]
+    def flaky_fsync(fd):
+        if not failures: failures.append(fd); raise OSError(errno.EIO,"Input/output error")
+        return real_fsync(fd)
+    monkeypatch.setattr(storage_module.os,"fsync",flaky_fsync)
+    with pytest.raises(OSError) as exc: store.append(upload,0,data)
+    assert exc.value.errno==errno.EIO and not isinstance(exc.value,InsufficientStorage)
+    row=store.get_upload(upload["id"])
+    assert partial.stat().st_size==0 and row["offset"]==0 and row["status"]=="uploading" and row["reserved_bytes"]==len(data)
+    # The retry at the committed offset succeeds instead of looping on 409.
+    assert store.append(upload,0,data)["status"]=="complete"
+
+def test_trailing_slash_is_not_redirected(client: TestClient, invitation):
+    _,token,_=invitation
+    for path in (f"/drop/i/{token}/",f"/drop/api/invites/{token}/policy/","/healthz/"):
+        response=client.get(path,follow_redirects=False)
+        assert response.status_code==404 and "location" not in response.headers, path
+
+def test_sweep_keeps_upload_resumed_between_snapshot_and_lock(settings: Settings):
+    store=Store(settings); store.initialize(); token="sweep-resume-token-1234"
+    store.create_invite(token,"password",InviteSpec("Resume","Resume","photos",int(time.time())+60,1000,2,1500))
+    upload=store.reserve_upload(store.find_invite(token),"resumed.jpg",100)
+    with store.connect(True) as conn: conn.execute("UPDATE uploads SET updated_at=0 WHERE id=?",(upload["id"],))
+    original=store.upload_lock
+    @contextmanager
+    def resume_before_lock(row):
+        with store.connect(True) as conn: conn.execute("UPDATE uploads SET updated_at=? WHERE id=?",(1000,row["id"]))
+        with original(row): yield
+    store.upload_lock=resume_before_lock
+    assert store.sweep(now=1000)==0
+    assert store.get_upload(upload["id"])["status"]=="uploading"
+    partial,_=store.paths(upload["invite_id"],upload["id"],upload["extension"]); assert partial.exists()
+    store.upload_lock=original
+    with store.connect(True) as conn: conn.execute("UPDATE uploads SET updated_at=0 WHERE id=?",(upload["id"],))
+    assert store.sweep(now=1000)==1
+
+def test_missing_canonical_file_makes_new_upload_canonical(settings: Settings, caplog):
+    store=Store(settings); store.initialize(); token="canonical-missing-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Canonical","Canonical","photos",int(time.time())+60,1000,4,2000))
+    data=b"\xff\xd8\xffcanonical-gone"
+    first=store.reserve_upload(store.find_invite(token),"first.jpg",len(data)); store.append(first,0,data)
+    store.paths(invite_id,first["id"],first["extension"])[1].unlink()
+    caplog.set_level("WARNING")
+    second=store.reserve_upload(store.find_invite(token),"second.jpg",len(data))
+    assert store.append(second,0,data)["status"]=="complete"
+    assert store.paths(invite_id,second["id"],second["extension"])[1].is_file()
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM duplicate_receipts").fetchone()[0]==0
+        assert conn.execute("SELECT COUNT(*) FROM uploads WHERE status='complete'").fetchone()[0]==2
+    text="\n".join(record.getMessage() for record in caplog.records)
+    assert "canonical_missing" in text and first["id"] not in text and str(settings.incoming_root) not in text
+    third=store.reserve_upload(store.find_invite(token),"third.jpg",len(data))
+    assert store.append(third,0,data)["status"]=="duplicate"
+    caplog.clear(); result=store.reconcile()
+    assert result["orphaned"]==0 and store.get_upload(first["id"])["status"]=="complete"
+    assert "completed_missing" in "\n".join(record.getMessage() for record in caplog.records)
+
+def test_reconcile_continues_when_canonical_is_missing(settings: Settings, caplog):
+    store=Store(settings); store.initialize(); token="reconcile-canonical-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Reconcile","Reconcile","photos",int(time.time())+60,1000,3,1500))
+    data=b"\xff\xd8\xffcrash-canonical-gone"
+    first=store.reserve_upload(store.find_invite(token),"first.jpg",len(data)); store.append(first,0,data)
+    store.paths(invite_id,first["id"],first["extension"])[1].unlink()
+    second=store.reserve_upload(store.find_invite(token),"second.jpg",len(data))
+    partial,completed=store.paths(invite_id,second["id"],second["extension"])
+    partial.write_bytes(data); os.replace(partial,completed)
+    caplog.set_level("WARNING"); result=store.reconcile()
+    assert result["fixed"]>=1 and completed.is_file()
+    assert store.get_upload(second["id"])["status"]=="complete"
+    text="\n".join(record.getMessage() for record in caplog.records)
+    assert "canonical_missing" in text and "completed_missing" in text and str(settings.incoming_root) not in text
+    manifest=json.loads((settings.incoming_root/invite_id/"manifest.json").read_text())
+    assert second["id"] in {entry["uploadId"] for entry in manifest["files"]}
+
+def test_upload_size_must_be_a_strict_integer(client: TestClient, invitation):
+    _,token,_=invitation; assert unlock(client,token).status_code==204
+    for size in (10.0,"10",True):
+        response=client.post(f"/drop/api/invites/{token}/uploads",json={"name":"x.jpg","size":size},
+            headers={"Origin":ORIGIN,"X-Drop-CSRF":csrf(client)})
+        assert response.status_code==422 and response.json()["error"]=="invalid_request", size
+
+def test_malformed_stored_hash_is_a_verification_failure(settings: Settings):
+    store=Store(settings); store.initialize(); token="bad-hash-token-1234"
+    invite_id=store.create_invite(token,"password",InviteSpec("Hash","Hash","photos",int(time.time())+60,1000,2,1500))
+    with store.connect(True) as conn: conn.execute("UPDATE invites SET password_hash='not-an-argon2-hash' WHERE id=?",(invite_id,))
+    assert store.verify_password(store.find_invite(token),"password") is False
+
+def test_cli_storage_error_is_one_line_and_exit_status_1(settings: Settings,monkeypatch,capsys):
+    env={"INCOMING_ROOT":str(settings.incoming_root),"STATE_DB":str(settings.state_db),
+         "PUBLIC_BASE_URL":ORIGIN,"SESSION_SECRET":"s"*48,"COOKIE_SECURE":"true",
+         "GLOBAL_BUDGET_BYTES":"10000000","DISK_RESERVE_BYTES":"1",
+         "DEFAULT_MAX_FILE_BYTES":"1000","DEFAULT_MAX_FILES":"2","DEFAULT_QUOTA_BYTES":"1500"}
+    for name,value in env.items(): monkeypatch.setenv(name,value)
+    assert cli_main(["open","--label","Purge me","--ttl","1h","--json"])==0
+    invite_id=json.loads(capsys.readouterr().out)["id"]
+    with pytest.raises(SystemExit) as exc: cli_main(["purge",invite_id,"--yes"])
+    message=exc.value.code
+    assert isinstance(message,str) and "Close the invitation" in message and "\n" not in message
+    assert str(settings.state_db) not in message and "Traceback" not in message
+    assert cli_main(["sweep","--json"])==0
+    assert set(json.loads(capsys.readouterr().out)["reconciled"])=={"fixed","removed","orphaned"}
