@@ -4,6 +4,9 @@
   const CHUNK_BYTES = 8 * 1024 * 1024;
   const MAX_BROWSER_CONCURRENCY = 4;
   const MAX_AUTOMATIC_RETRIES = 3;
+  // Consecutive 409 offset conflicts tolerated before an upload is failed. A
+  // server whose stored offset never converges must not be retried forever.
+  const MAX_OFFSET_CONFLICTS = 5;
   const MUTATING_METHODS = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
 
   const elements = {
@@ -631,6 +634,7 @@
 
   async function uploadChunks(item) {
     await headUpload(item);
+    let offsetConflicts = 0;
     while (item.offset < item.size) {
       if (item.state === 'cancelled') return;
       const start = item.offset;
@@ -656,6 +660,10 @@
       item.controller = null;
 
       if (response.status === 409) {
+        offsetConflicts += 1;
+        if (offsetConflicts > MAX_OFFSET_CONFLICTS) {
+          throw new Error('The server kept reporting a different upload position. Try again later.');
+        }
         const conflictState = response.headers.get('Upload-State');
         const rawExpected = response.headers.get('Upload-Offset');
         if (rawExpected && /^\d+$/.test(rawExpected)) {
@@ -688,6 +696,7 @@
       }
       item.offset = acknowledged;
       item.retryCount = 0;
+      offsetConflicts = 0;
       persistResumes();
       updateItem(item);
     }

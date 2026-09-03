@@ -95,6 +95,7 @@ incoming/
   <opaque-invite-id>/
     partial/
     completed/
+    orphaned/   # completed files unknown to state.db, kept for operator review
 state/
   state.db
 ```

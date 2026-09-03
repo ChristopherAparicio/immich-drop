@@ -1,0 +1,6 @@
+# Development and CI extras on top of the runtime closure. Compile with:
+#   uv pip compile requirements-dev.in --generate-hashes --universal --no-annotate --python-version 3.13 -o requirements-dev.txt
+-r requirements.in
+httpx==0.28.1
+pip-audit==2.10.1
+pytest==9.1.1

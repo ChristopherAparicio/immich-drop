@@ -61,6 +61,34 @@ excluded if contributors can retry and the invitation is still valid. Restore
 the state database and staging filesystem consistently; reconciliation must run
 before reopening the public route.
 
+### Orphaned completed files
+
+Startup reconciliation (and `python -m app.cli sweep`) compares the staging
+tree with `state.db`. Stray `.part` and lock files that the database does not
+know about are deleted. A regular file under `<invite>/completed/` that the
+database does not know about is **never deleted**: it is moved, without
+following symlinks or overwriting, into `<invite>/orphaned/`. Such a file is
+normally a finished upload whose row was lost because an older `state.db` was
+restored, so it may still be wanted.
+
+Only a coarse count is logged (`reconcile action=orphan_completed count=N`);
+no path or filename appears in the log. To review:
+
+1. List `orphaned/` for the invitation on the NAS. File names are the server
+   generated object identifier plus the validated extension; the original
+   visitor filename is not recoverable without the matching database row.
+2. Verify the file by content (signature, hash) as you would any staged object
+   before importing it manually. It is not listed in `manifest.json`, does not
+   count against the invitation quota, and is not served or deduplicated.
+3. Purge what you do not keep. `python -m app.cli purge <id>` removes the whole
+   invitation directory including `orphaned/` once the invitation is closed;
+   otherwise delete the reviewed files yourself. Nothing under `orphaned/` is
+   touched again by the application.
+
+A completed upload whose row exists but whose file is missing is logged as
+`reconcile action=completed_missing outcome=kept`; the row is kept and startup
+continues. Investigate the storage restore before reopening the invitation.
+
 ## Updates
 
 Build from a reviewed commit, pin the resulting image digest in the deployment

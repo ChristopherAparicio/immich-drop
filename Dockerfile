@@ -5,7 +5,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /build
 COPY requirements.txt .
-RUN python -m pip wheel --wheel-dir=/wheels --requirement requirements.txt
+RUN python -m pip wheel --wheel-dir=/wheels --require-hashes --requirement requirements.txt
 
 FROM python:3.13-alpine3.23@sha256:7ea3f82de8ea6d4fb7e5d2bbe3fe3c9d931700b7a529f1fe5769e42abe514ca1
 
@@ -22,14 +22,16 @@ RUN apk add --no-cache \
       'sqlite-libs=3.53.4-r0'
 COPY --from=build /wheels /wheels
 COPY requirements.txt .
-RUN python -m pip install --no-index --find-links=/wheels --requirement requirements.txt \
+RUN python -m pip install --no-index --find-links=/wheels --require-hashes --requirement requirements.txt \
     && python -m pip uninstall --yes pip \
     && rm -rf /wheels /root/.cache
 
-COPY --chown=65532:65532 app ./app
-COPY --chown=65532:65532 frontend ./frontend
-COPY --chown=65532:65532 main.py ./main.py
-COPY --chown=65532:65532 dropctl.py ./dropctl.py
+# Application code stays root-owned and read-only for the runtime UID. The only
+# writable locations are the mounted state and staging volumes.
+COPY app ./app
+COPY frontend ./frontend
+COPY main.py ./main.py
+COPY dropctl.py ./dropctl.py
 
 USER 65532:65532
 EXPOSE 8080

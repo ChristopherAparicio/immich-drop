@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import errno
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,9 +18,12 @@ from pathlib import Path
 from typing import Iterator
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerificationError
+from argon2.exceptions import InvalidHashError, VerificationError
 
 from app.config import MARKER_NAME, Settings
+
+# Coarse operational events only: never a path, token, filename, or exception text.
+logger = logging.getLogger("immich_drop.storage")
 
 PROFILES = {"photos", "videos", "both", "live"}
 EXTENSIONS = {
@@ -204,8 +208,13 @@ class Store:
         if row["expires_at"] <= int(time.time()): raise Expired()
 
     def verify_password(self, invite: sqlite3.Row, password: str) -> bool:
+        # A malformed stored hash is a verification failure, not a 500.
         try: return self.passwords.verify(invite["password_hash"], password)
-        except (VerificationError, TypeError): return False
+        except (VerificationError, InvalidHashError, TypeError): return False
+
+    def get_invite(self, invite_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM invites WHERE id=?", (invite_id,)).fetchone()
 
     def paths(self, invite_id: str, upload_id: str, extension: str) -> tuple[Path, Path]:
         base = self.settings.incoming_root / invite_id
@@ -351,19 +360,31 @@ class Store:
             try:
                 return self._append_locked(fresh,expected_offset,data,checksum)
             except OSError as exc:
-                if exc.errno not in {errno.ENOSPC,errno.EDQUOT}: raise
-                partial,_=self.paths(fresh["invite_id"],fresh["id"],fresh["extension"])
-                actual=expected_offset
-                if partial.exists():
-                    try:
-                        with partial.open("r+b",buffering=0) as handle:
-                            handle.truncate(expected_offset); os.fsync(handle.fileno())
-                        actual=expected_offset
-                    except OSError:
-                        actual=min(partial.stat().st_size,fresh["declared_size"])
-                with self.connect(True) as conn:
-                    conn.execute("UPDATE uploads SET offset=?,updated_at=? WHERE id=? AND status='uploading'",(actual,int(time.time()),fresh["id"]))
-                raise InsufficientStorage("Staging storage is temporarily full") from exc
+                # Any failed write or fsync (ENOSPC, EIO, EACCES, ...) may leave
+                # the .part longer than the committed offset. Roll the file back
+                # to the offset the database still holds while the lock is ours;
+                # otherwise every retry at that offset would 409 forever.
+                self._rollback_partial(fresh,expected_offset)
+                if exc.errno in {errno.ENOSPC,errno.EDQUOT}:
+                    raise InsufficientStorage("Staging storage is temporarily full") from exc
+                raise
+
+    def _rollback_partial(self, upload: sqlite3.Row, expected_offset: int) -> None:
+        partial,_=self.paths(upload["invite_id"],upload["id"],upload["extension"])
+        actual=expected_offset
+        if partial.is_file() and not partial.is_symlink():
+            try:
+                with partial.open("r+b",buffering=0) as handle:
+                    handle.truncate(expected_offset); os.fsync(handle.fileno())
+            except OSError:
+                try: actual=min(partial.stat().st_size,upload["declared_size"])
+                except OSError: return
+        try:
+            with self.connect(True) as conn:
+                conn.execute("UPDATE uploads SET offset=?,updated_at=? WHERE id=? AND status='uploading'",
+                             (actual,int(time.time()),upload["id"]))
+        except sqlite3.Error:
+            logger.warning("append action=rollback outcome=database_unavailable")
 
     @contextmanager
     def upload_lock(self, upload: sqlite3.Row):
@@ -405,11 +426,19 @@ class Store:
                 WHERE invite_id=? AND declared_size=? AND category=? AND sha256=? AND status='complete'
                 ORDER BY completed_at,created_at,id""",
                 (fresh["invite_id"],fresh["declared_size"],fresh["category"],digest)).fetchall()
-            canonical=candidates[0] if candidates else None
+            # The oldest matching completion whose file is still present becomes
+            # canonical. A recorded completion whose file has vanished is not a
+            # deduplication target: the new file is kept as the new canonical.
+            canonical=None
+            for candidate in candidates:
+                if candidate["id"]==fresh["id"]:
+                    canonical=candidate; break
+                candidate_path=self.paths(candidate["invite_id"],candidate["id"],candidate["extension"])[1]
+                if candidate_path.is_symlink() or not candidate_path.is_file():
+                    logger.warning("dedup action=canonical_missing outcome=new_canonical")
+                    continue
+                canonical=candidate; break
             if canonical is not None and canonical["id"] != fresh["id"]:
-                canonical_path=self.paths(canonical["invite_id"],canonical["id"],canonical["extension"])[1]
-                if canonical_path.is_symlink() or not canonical_path.is_file():
-                    raise RuntimeError("canonical staging file is missing")
                 receipt_expiry=min(invite["expires_at"],now+self.settings.incomplete_ttl_seconds,
                     now+self.settings.session_max_age_seconds)
                 conn.execute("""INSERT INTO duplicate_receipts
@@ -537,6 +566,12 @@ class Store:
                 try: fresh=self.get_upload(row["id"])
                 except NotFound: continue
                 if fresh["status"]!="uploading": continue
+                # Re-evaluate the whole expiry predicate under the lock: an upload
+                # that resumed between the snapshot and the lock is not abandoned.
+                invite=self.get_invite(fresh["invite_id"])
+                if invite is None: continue
+                if not (fresh["updated_at"]<cutoff or invite["expires_at"]<=now or invite["closed_at"] is not None):
+                    continue
                 self.paths(fresh["invite_id"],fresh["id"],fresh["extension"])[0].unlink(missing_ok=True)
                 swept += int(self._delete_terminal_row(fresh,"uploading"))
         with self.connect(True) as conn:
@@ -552,7 +587,7 @@ class Store:
         return swept
 
     def reconcile(self) -> dict[str,int]:
-        fixed = removed = 0; manifest_invites:set[str]=set()
+        fixed = removed = orphaned = 0; manifest_invites:set[str]=set()
         with self.connect() as conn: rows = conn.execute("SELECT * FROM uploads WHERE status IN ('uploading','complete')").fetchall()
         for row in rows:
             partial, completed = self.paths(row["invite_id"],row["id"],row["extension"])
@@ -584,7 +619,9 @@ class Store:
                         with self.connect(True) as conn: conn.execute("UPDATE uploads SET offset=? WHERE id=?",(actual,fresh["id"]))
                         fixed+=1
                 elif fresh["status"]=="complete" and not completed.exists():
-                    raise RuntimeError("completed staging file is missing")
+                    # Never abort startup or delete accounting for a completed
+                    # upload whose file is gone; the operator reviews the warning.
+                    logger.warning("reconcile action=completed_missing outcome=kept")
                 elif fresh["status"]=="uploading" and not partial.exists():
                     self._delete_terminal_row(fresh,"uploading")
                     fixed+=1
@@ -604,13 +641,22 @@ class Store:
                 known.update({os.path.abspath(partial),os.path.abspath(completed),os.path.abspath(self._lock_path(row))})
             for receipt in receipts:
                 known.add(os.path.abspath(self.settings.incoming_root/receipt["invite_id"] / ".locks" / f"{receipt['upload_id']}.lock"))
-            removed+=self._remove_orphans_without_following_symlinks(known)
+            removed_now,orphaned_now=self._remove_orphans_without_following_symlinks(known)
+            removed+=removed_now; orphaned+=orphaned_now
+        if orphaned: logger.warning("reconcile action=orphan_completed count=%s",orphaned)
         for invite_id in manifest_invites: self.write_manifest(invite_id)
-        return {"fixed":fixed,"removed":removed}
+        return {"fixed":fixed,"removed":removed,"orphaned":orphaned}
 
-    def _remove_orphans_without_following_symlinks(self, known: set[str]) -> int:
-        """Clean only immediate staging structure entries, never traversing a symlink."""
-        removed=0; directory_flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+    def _remove_orphans_without_following_symlinks(self, known: set[str]) -> tuple[int,int]:
+        """Clean only immediate staging structure entries, never traversing a symlink.
+
+        Stray ``.part`` and lock files are deleted. A regular file under
+        ``completed/`` that the database does not know about is never deleted:
+        it is moved into the invitation's ``orphaned/`` directory for operator
+        review, because it may be a finished upload whose row was lost when an
+        older ``state.db`` was restored.
+        """
+        removed=orphaned=0; directory_flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
         root_fd=os.open(self.settings.incoming_root,directory_flags)
         try:
             with os.scandir(root_fd) as invites:
@@ -635,11 +681,34 @@ class Store:
                                             if entry.is_symlink(): os.unlink(entry.name,dir_fd=child_fd); removed+=1; continue
                                             if not entry.is_file(follow_symlinks=False): continue
                                             lexical=os.path.abspath(self.settings.incoming_root/invite.name/child.name/entry.name)
-                                            if lexical not in known: os.unlink(entry.name,dir_fd=child_fd); removed+=1
+                                            if lexical in known: continue
+                                            if child.name=="completed":
+                                                # Leaving an unknown file in place is harmless (it is
+                                                # not in the manifest); failing startup over it is not.
+                                                try: self._orphan_completed(invite_fd,child_fd,entry.name); orphaned+=1
+                                                except OSError: logger.warning("reconcile action=orphan_completed outcome=failed")
+                                            else:
+                                                os.unlink(entry.name,dir_fd=child_fd); removed+=1
                                 finally: os.close(child_fd)
                     finally: os.close(invite_fd)
         finally: os.close(root_fd)
-        return removed
+        return removed,orphaned
+
+    @staticmethod
+    def _orphan_completed(invite_fd: int, completed_fd: int, name: str) -> None:
+        """Move ``completed/<name>`` to ``orphaned/`` without following symlinks or overwriting."""
+        try: os.mkdir("orphaned",0o700,dir_fd=invite_fd)
+        except FileExistsError: pass
+        orphaned_fd=os.open("orphaned",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=invite_fd)
+        try:
+            target=name
+            while True:
+                try: os.stat(target,dir_fd=orphaned_fd,follow_symlinks=False)
+                except FileNotFoundError: break
+                stem,ext=os.path.splitext(name); target=f"{stem}-{uuid.uuid4()}{ext}"
+            os.rename(name,target,src_dir_fd=completed_fd,dst_dir_fd=orphaned_fd)
+            os.fsync(orphaned_fd); os.fsync(completed_fd)
+        finally: os.close(orphaned_fd)
 
     def purge(self, invite_id: str) -> bool:
         try: uuid.UUID(invite_id)
