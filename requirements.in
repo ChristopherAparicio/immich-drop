@@ -1,4 +1,4 @@
 argon2-cffi==25.1.0
-fastapi==0.141.1
+fastapi==0.142.2
 itsdangerous==2.2.0
-uvicorn==0.52.4
+uvicorn==0.54.0
